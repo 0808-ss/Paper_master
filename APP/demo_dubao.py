@@ -25,19 +25,18 @@ JITTER_PROBABILITY = 0.2
 JITTER_DELAYS = [5, 10, 15]
 
 # ================= I帧优先机制测试参数 =================
-# 传给 video_sender 的传输层抢占配置 "enabled,L1,L2,L3,L4,burst"：
-#   enabled: 运行期总开关（0 = 完全基线，机制不生效）
-#   L1(包级抢占): I帧存在时整包只装I帧，BP帧完全让路
-#   L2(流级选择): send_queue 头部为 I 帧的流优先
-#   L3(路径级抢占): min-RTT 且 cwin 允许的路径优先给 I 帧
-#   L4(cwin限幅突破): 每 RTT 最多 burst 个包突破拥塞窗口
-#   burst: L4 每 RTT 突破配额（包数，0 = 关闭 L4）
+# 传给 video_sender 的传输层抢占开关 "0/1"：
+#   0 = 完全基线（机制不生效，等同于未修改的 picoquic 行为）
+#   1 = 启用 I/BP 帧抢占（默认）
+# 机制说明（对应 picoquic work@9e620450）：
+#   - 应用按"一帧一流"把每帧数据经 picoquic_add_to_stream_with_frame_type 标记 I/BP
+#   - 发包前先放行 I 帧队列（I 帧流置优先级 0），I 队列空才放行 BP 帧
+#   - 跨帧、多路径抢占由未改动的原调度器完成
 # 可用环境变量 PREEMPT_CFG 覆盖（便于不修改代码跑消融实验）。
 # 消融实验示例：
-#   基线(机制关闭):  "0,1,1,1,1,0"
-#   仅包级抢占:      "1,1,0,0,0,0"
-#   全开(默认):      "1,1,1,1,1,4"
-PREEMPT_CONFIG = "1,1,1,1,1,4"
+#   基线(机制关): "0"
+#   全开(默认):   "1"
+PREEMPT_CONFIG = "1"
 
 # 实验归档标签：每次运行结束后把 qlog_sender/qlog_receiver/send.log/recv.log/
 # link_metrics.csv 归档到 runs/<RUN_TAG>_<时间戳>/，避免消融对比时被下次运行覆盖。
@@ -549,7 +548,7 @@ def run():
         # I帧优先机制测试：归档本次运行产物（消融对比用）
         run_tag = os.environ.get("RUN_TAG", None)
         if run_tag is None:
-            run_tag = ("cfg_" + preempt_cfg.replace(",", "_")
+            run_tag = ("cfg_" + preempt_cfg
                        + "_" + time.strftime("%Y%m%d_%H%M%S"))
         archive_run(cwd, run_tag)
 

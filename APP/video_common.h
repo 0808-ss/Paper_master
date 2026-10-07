@@ -13,7 +13,9 @@
  *   [ pkt_idx      (uint32) ] 帧内包序号
  *   [ total_pkts   (uint32) ] 帧总包数
  *   [ payload_size (uint32) ] 本包 payload 字节数
- * 注意：与 picoquic 传输层的 picoquic_frame_class_enum 语义一致，
+ * 注意：frame_class 为应用层约定（0=BP,1=I），仅用于接收端日志观测；
+ * 传输层帧标记为 picoquic.h 的 PICOQUIC_VIDEO_FRAME_I/BP（值序相反），
+ * 由 sender 按帧尺寸判定后映射，二者不共用同一枚举。
  * 修改本布局时 sender/receiver 必须同步重编译。
  */
 #define APP_PKT_HEADER_SIZE 20

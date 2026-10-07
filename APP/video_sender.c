@@ -456,25 +456,21 @@ static uint8_t* build_frame_stream_buffer(int frame_idx, int frame_class, const 
 }
 
 /*
- * I帧优先机制测试：解析抢占配置字符串 "enabled,L1,L2,L3,L4,burst"
- *   - enabled: 运行期总开关（0 = 完全基线行为）
- *   - L1: 包级抢占（I帧存在时整包只装I帧，BP完全让路）
- *   - L2: 流级选择（send_queue 头部为 I 帧的流优先）
- *   - L3: 路径级抢占（min-RTT 且 cwin 允许的路径优先给 I 帧）
- *   - L4: cwin 限幅突破（每 RTT 最多 burst 个包突破拥塞窗口）
- * 解析失败时使用默认值（全开 burst=4）。
+ * I帧优先机制测试：解析抢占配置字符串 "enabled"
+ *   - enabled: 0 = 完全基线（机制不生效，等同于未修改的 picoquic 行为）；
+ *              1 = 启用 I/BP 帧抢占（默认）
+ * 解析失败时使用默认值 enabled=1。
  */
-static void parse_preempt_config(const char* cfg, int* enabled, int* l1, int* l2, int* l3, int* l4, uint32_t* burst)
+static void parse_preempt_config(const char* cfg, int* enabled)
 {
-    *enabled = 1; *l1 = 1; *l2 = 1; *l3 = 1; *l4 = 1; *burst = 4;
+    *enabled = 1;
     if (cfg == NULL) return;
 
-    int e = 0, a = 0, b = 0, c = 0, d = 0;
-    unsigned int bu = 0;
-    if (sscanf(cfg, "%d,%d,%d,%d,%d,%u", &e, &a, &b, &c, &d, &bu) == 6) {
-        *enabled = e; *l1 = a; *l2 = b; *l3 = c; *l4 = d; *burst = bu;
+    int e = 0;
+    if (sscanf(cfg, "%d", &e) == 1) {
+        *enabled = e;
     } else {
-        printf("[PREEMPT] Warning: cannot parse preempt_cfg '%s', using defaults (1,1,1,1,1,4)\n", cfg);
+        printf("[PREEMPT] Warning: cannot parse preempt_cfg '%s', using default (1=enabled)\n", cfg);
     }
 }
 
@@ -483,9 +479,8 @@ int main(int argc, char** argv)
     setbuf(stdout, NULL);
 
     if (argc < 4) {
-        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_cfg]\n", argv[0]);
-        printf("  preempt_cfg (可选): \"enabled,L1,L2,L3,L4,burst\"，I帧优先机制配置；\n");
-        printf("    例: \"0,1,1,1,1,0\" 基线(机制关) / \"1,1,1,1,1,4\" 全开(默认)\n");
+        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_enabled]\n", argv[0]);
+        printf("  preempt_enabled (可选): 0 = 基线(机制关) / 1 = 启用 I/BP 帧抢占（默认）\n");
         return 1;
     }
 
@@ -582,18 +577,17 @@ int main(int argc, char** argv)
 
     picoquic_set_callback(cnx, sender_callback, &app_ctx);
 
-#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
-    /* I帧优先机制测试：启用/配置传输层抢占调度（运行期开关，支持消融）。
-     * 配置格式见 parse_preempt_config，通过第 4 个命令行参数传入；
-     * demo_dubao.py 通过 PREEMPT_CFG 环境变量透传。 */
+    /* I帧优先机制测试：启用/关闭传输层 I/BP 帧抢占（运行期开关，支持消融）。
+     * 配置为 0/1，通过第 4 个命令行参数传入；demo_dubao.py 通过 PREEMPT_CFG 环境变量透传。
+     * 当前机制（picoquic work@9e620450）：应用按"一帧一流"经
+     * picoquic_add_to_stream_with_frame_type 标记 I/BP；发包前先放行 I 帧队列
+     * （I 帧流置优先级 0），I 队列空才放行 BP 帧；跨帧与多路径抢占由未改动的调度器完成。 */
     const char* preempt_cfg = (argc > 4) ? argv[4] : NULL;
-    int pe = 1, pl1 = 1, pl2 = 1, pl3 = 1, pl4 = 1;
-    uint32_t pburst = 4;
-    parse_preempt_config(preempt_cfg, &pe, &pl1, &pl2, &pl3, &pl4, &pburst);
-    picoquic_set_iframe_preemption_config(cnx, pe, pl1, pl2, pl3, pl4, pburst);
-    printf("[PREEMPT] iframe-preemption cfg='%s' -> enabled=%d L1(packet)=%d L2(stream)=%d L3(path)=%d L4(cwin)=%d burst=%u\n",
-        (preempt_cfg ? preempt_cfg : "(default)"), pe, pl1, pl2, pl3, pl4, pburst);
-#endif
+    int pe = 1;
+    parse_preempt_config(preempt_cfg, &pe);
+    picoquic_set_frame_preemption(cnx, pe);
+    printf("[PREEMPT] frame-preemption cfg='%s' -> enabled=%d\n",
+        (preempt_cfg ? preempt_cfg : "(default)"), pe);
 
     if (picoquic_start_client_cnx(cnx) != 0) {
         fprintf(stderr, "Could not start client connection\n");
@@ -671,11 +665,7 @@ int main(int argc, char** argv)
                 preprocess_chunk_deadline(&new_chunk);
                 enqueue_chunk(new_chunk);
 
-#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
                 const char* fc_name = (frame->size >= app_ctx.max_frame_size && app_ctx.max_frame_size > 0) ? "I" : "BP";
-#else
-                const char* fc_name = "BP";
-#endif
                 printf("[FRAME_GEN] frame=%d size=%zu npkts=%d class=%s gen_ts=%lu\n",
                     new_chunk.frame_idx, frame->size,
                     (int)((frame->size + APP_PKT_PAYLOAD_MAX - 1) / APP_PKT_PAYLOAD_MAX),
@@ -706,19 +696,16 @@ int main(int argc, char** argv)
 
                 uint64_t stream_id = picoquic_get_next_local_stream_id(cnx, 1);
 
-#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
-                /* I帧优先机制测试：按帧尺寸判定帧类并传给传输层双队列。
-                 * size == 轨迹最大尺寸 => I 帧（关键帧），否则 BP 帧。 */
+                /* I帧优先机制测试：按帧尺寸判定帧类并传给传输层。
+                 * size == 轨迹最大尺寸 => I 帧（关键帧），否则 BP 帧。
+                 * 传输层标记用 picoquic.h 的 PICOQUIC_VIDEO_FRAME_I/BP（值序与应用层相反），
+                 * 应用头 frame_class 用 APP_FRAME_CLASS_I/BP（仅接收端日志观测）。 */
                 int frame_class = APP_FRAME_CLASS_BP;
                 if (app_ctx.max_frame_size > 0 &&
                     app_ctx.frames[sending_chunk->frame_idx].size >= app_ctx.max_frame_size) {
                     frame_class = APP_FRAME_CLASS_I;
                 }
                 const char* fc_name = (frame_class == APP_FRAME_CLASS_I) ? "I" : "BP";
-#else
-                int frame_class = APP_FRAME_CLASS_BP;
-                const char* fc_name = "BP";
-#endif
 
                 size_t stream_len = 0;
                 uint8_t* stream_buffer = build_frame_stream_buffer(sending_chunk->frame_idx, frame_class,
@@ -728,12 +715,10 @@ int main(int argc, char** argv)
                     break;
                 }
 
-#if PICOQUIC_IFRAME_PREEMPTION_SUPPORTED
-                int ret_add = picoquic_add_to_stream_with_ctx_ex(cnx, stream_id, stream_buffer, stream_len, 1, NULL,
-                    (frame_class == APP_FRAME_CLASS_I) ? picoquic_frame_class_i : picoquic_frame_class_bp);
-#else
-                int ret_add = picoquic_add_to_stream(cnx, stream_id, stream_buffer, stream_len, 1);
-#endif
+                /* I帧优先机制测试：按帧类标记数据（一帧一流）。
+                 * 机制关闭或标记非法时，该 API 行为与 picoquic_add_to_stream 完全一致。 */
+                int ret_add = picoquic_add_to_stream_with_frame_type(cnx, stream_id, stream_buffer, stream_len, 1,
+                    (frame_class == APP_FRAME_CLASS_I) ? PICOQUIC_VIDEO_FRAME_I : PICOQUIC_VIDEO_FRAME_BP);
 
                 if (ret_add == 0) {
                     printf("[STREAM_MAP] stream=%" PRIu64 " frame=%d size=%zu stream_len=%zu class=%s first_pkt_ts=%lu\n",
