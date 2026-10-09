@@ -15,13 +15,22 @@
  *   [ payload_size (uint32) ] 本包 payload 字节数
  * 注意：frame_class 为应用层约定（0=BP,1=I），仅用于接收端日志观测；
  * 传输层帧标记为 picoquic.h 的 PICOQUIC_VIDEO_FRAME_I/BP（值序相反），
- * 由 sender 按帧尺寸判定后映射，二者不共用同一枚举。
+ * 由 sender 按 GOP 间隔判定后映射，二者不共用同一枚举。
  * 修改本布局时 sender/receiver 必须同步重编译。
  */
 #define APP_PKT_HEADER_SIZE 20
 #define APP_PKT_PAYLOAD_MAX 1200
 #define APP_FRAME_CLASS_BP  0
 #define APP_FRAME_CLASS_I   1
+
+/* ================= GOP 参数（I 帧间隔，单位：帧） =================
+ * GOP_SIZE：默认 I 帧（关键帧）间隔。帧索引为 GOP_SIZE 整数倍的帧
+ * （0, GOP_SIZE, 2*GOP_SIZE, ...）标记为 I 帧，其余为 BP 帧。
+ * video_sender 可通过第 5 个命令行参数覆盖（demo_dubao.py 经 GOP_SIZE_CFG
+ * 环境变量透传），便于不同 GOP 间隔的消融实验；0 = 所有帧按 BP 发送。
+ * 注意：当前 3 条轨迹的关键帧恰好是尺寸最大的帧且每 30 帧出现一次；
+ * 修改 GOP_SIZE 时须保证轨迹中真实关键帧位置与之匹配。 */
+#define GOP_SIZE 30
 
 /* 视频帧结构 */
 typedef struct {

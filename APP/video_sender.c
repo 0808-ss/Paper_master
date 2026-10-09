@@ -96,8 +96,9 @@ typedef struct {
     /* 全局唯一包序号 */
     uint32_t global_pkt_seq;
 
-    /* I帧优先机制测试：轨迹中最大帧尺寸（用于判定 I 帧：size == max 即 GOP 关键帧） */
-    size_t max_frame_size;
+    /* I帧优先机制测试：I 帧间隔（帧数）。帧索引为 gop_size 整数倍 => I 帧；
+     * 0 = 所有帧按 BP 发送（无 I 帧标记）。默认 GOP_SIZE，可由第 5 个命令行参数覆盖。 */
+    uint32_t gop_size;
 } sender_ctx_t;
 
 static int collect_local_ipv4_addrs(sender_ctx_t* ctx, uint16_t n_port)
@@ -474,19 +475,46 @@ static void parse_preempt_config(const char* cfg, int* enabled)
     }
 }
 
+/*
+ * I帧优先机制测试：解析 GOP 间隔配置字符串（单位：帧）
+ *   - 0 = 所有帧按 BP 发送（无 I 帧标记，可用于对照）
+ *   - N (>0) = 帧索引为 N 整数倍的帧（0, N, 2N, ...）标记为 I 帧
+ * 解析失败时使用默认值（video_common.h 的 GOP_SIZE）。
+ */
+static void parse_gop_size_config(const char* cfg, uint32_t* gop_size)
+{
+    if (cfg == NULL) return;
+
+    unsigned int g = 0;
+    if (sscanf(cfg, "%u", &g) == 1) {
+        *gop_size = g;
+    } else {
+        printf("[GOP] Warning: cannot parse gop_size '%s', using default (%u)\n",
+            cfg, (unsigned int)GOP_SIZE);
+    }
+}
+
 int main(int argc, char** argv)
 {
     setbuf(stdout, NULL);
 
     if (argc < 4) {
-        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_enabled]\n", argv[0]);
+        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_enabled] [gop_size]\n", argv[0]);
         printf("  preempt_enabled (可选): 0 = 基线(机制关) / 1 = 启用 I/BP 帧抢占（默认）\n");
+        printf("  gop_size (可选): I 帧间隔帧数，帧索引为 gop_size 整数倍 => I 帧；\n");
+        printf("                  0 = 全 BP（无 I 帧标记）；默认 %u（video_common.h 的 GOP_SIZE）\n",
+            (unsigned int)GOP_SIZE);
         return 1;
     }
 
     const char* server_ip = argv[1];
     int port = atoi(argv[2]);
     const char* trace_file = argv[3];
+
+    /* I帧优先机制测试：GOP 间隔（第 5 个参数，默认 video_common.h 的 GOP_SIZE） */
+    const char* gop_cfg = (argc > 5) ? argv[5] : NULL;
+    uint32_t gop_size = GOP_SIZE;
+    parse_gop_size_config(gop_cfg, &gop_size);
 
     uint64_t current_time = picoquic_current_time();
 
@@ -534,17 +562,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* I帧优先机制测试：统计轨迹中最大帧尺寸。
-     * 判定规则：GOP 首帧（关键帧）是轨迹中尺寸最大的帧（本实验 3 条轨迹均如此），
-     * 因此 frame->size == max_frame_size 即视为 I 帧，其余为 BP 帧。 */
-    app_ctx.max_frame_size = 0;
-    for (int i = 0; i < app_ctx.frame_count; i++) {
-        if (app_ctx.frames[i].size > app_ctx.max_frame_size) {
-            app_ctx.max_frame_size = app_ctx.frames[i].size;
-        }
-    }
-    printf("[IFRAME] trace=%s frames=%d max_frame_size=%zu (size==max => I frame)\n",
-        trace_file, app_ctx.frame_count, app_ctx.max_frame_size);
+    /* I帧优先机制测试：GOP 间隔参数生效（帧索引取模判定，见发送循环）。
+     * 0 = 所有帧按 BP 发送；N>0 = 帧索引为 N 整数倍 => I 帧。
+     * 与旧判定（size==轨迹最大帧）在当前 3 条轨迹上等价：关键帧每 30 帧出现一次。 */
+    app_ctx.gop_size = gop_size;
+    printf("[GOP] trace=%s frames=%d gop_size=%u (frame_idx %% gop_size == 0 => I frame; 0 => all BP)\n",
+        trace_file, app_ctx.frame_count, (unsigned int)gop_size);
 
     struct sockaddr_storage addr;
     int is_name = 0;
@@ -665,7 +688,8 @@ int main(int argc, char** argv)
                 preprocess_chunk_deadline(&new_chunk);
                 enqueue_chunk(new_chunk);
 
-                const char* fc_name = (frame->size >= app_ctx.max_frame_size && app_ctx.max_frame_size > 0) ? "I" : "BP";
+                const char* fc_name = (app_ctx.gop_size > 0 &&
+                    ((uint32_t)new_chunk.frame_idx % app_ctx.gop_size == 0)) ? "I" : "BP";
                 printf("[FRAME_GEN] frame=%d size=%zu npkts=%d class=%s gen_ts=%lu\n",
                     new_chunk.frame_idx, frame->size,
                     (int)((frame->size + APP_PKT_PAYLOAD_MAX - 1) / APP_PKT_PAYLOAD_MAX),
@@ -696,13 +720,14 @@ int main(int argc, char** argv)
 
                 uint64_t stream_id = picoquic_get_next_local_stream_id(cnx, 1);
 
-                /* I帧优先机制测试：按帧尺寸判定帧类并传给传输层。
-                 * size == 轨迹最大尺寸 => I 帧（关键帧），否则 BP 帧。
+                /* I帧优先机制测试：按 GOP 间隔判定帧类并传给传输层。
+                 * 帧索引为 gop_size 整数倍（0, gop_size, 2*gop_size, ...）=> I 帧（关键帧），
+                 * 其余为 BP 帧；gop_size=0 => 全部按 BP 发送。
                  * 传输层标记用 picoquic.h 的 PICOQUIC_VIDEO_FRAME_I/BP（值序与应用层相反），
                  * 应用头 frame_class 用 APP_FRAME_CLASS_I/BP（仅接收端日志观测）。 */
                 int frame_class = APP_FRAME_CLASS_BP;
-                if (app_ctx.max_frame_size > 0 &&
-                    app_ctx.frames[sending_chunk->frame_idx].size >= app_ctx.max_frame_size) {
+                if (app_ctx.gop_size > 0 &&
+                    (uint32_t)sending_chunk->frame_idx % app_ctx.gop_size == 0) {
                     frame_class = APP_FRAME_CLASS_I;
                 }
                 const char* fc_name = (frame_class == APP_FRAME_CLASS_I) ? "I" : "BP";

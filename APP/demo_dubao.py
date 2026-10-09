@@ -38,9 +38,16 @@ JITTER_DELAYS = [5, 10, 15]
 #   全开(默认):   "1"
 PREEMPT_CONFIG = "1"
 
+# GOP 间隔（I 帧关键帧间隔，单位：帧）：传给 video_sender 第 5 个参数。
+#   帧索引为 GOP_SIZE 整数倍的帧（0, GOP_SIZE, 2*GOP_SIZE, ...）标记为 I 帧，
+#   其余为 BP 帧；0 = 所有帧按 BP 发送（无 I 帧标记，可用于对照）。
+#   修改 GOP_SIZE 时须保证轨迹中真实关键帧每 GOP_SIZE 帧出现一次（当前 3 条轨迹为 30）。
+# 可用环境变量 GOP_SIZE_CFG 覆盖（便于不同 GOP 间隔的消融实验不修改代码）。
+GOP_SIZE_CONFIG = "30"
+
 # 实验归档标签：每次运行结束后把 qlog_sender/qlog_receiver/send.log/recv.log/
 # link_metrics.csv 归档到 runs/<RUN_TAG>_<时间戳>/，避免消融对比时被下次运行覆盖。
-# 可用环境变量 RUN_TAG 覆盖；不设置时自动按抢占配置命名。
+# 可用环境变量 RUN_TAG 覆盖；不设置时自动按抢占配置与 GOP 间隔命名。
 RUN_TAG = ""
 
 # 初始化随机种子
@@ -517,7 +524,12 @@ def run():
     # 支持环境变量 PREEMPT_CFG 覆盖，便于消融实验不修改代码。
     preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
     info(f"*** Preemption Config: {preempt_cfg} ***\n")
-    h1.popen(f'{sender_bin} 10.0.1.2 12345 {video_trace} {preempt_cfg} > send.log 2>&1', shell=True, cwd=cwd)
+
+    # I帧优先机制测试：GOP 间隔透传给 video_sender（第 5 个参数），
+    # 支持环境变量 GOP_SIZE_CFG 覆盖，便于不同 GOP 间隔的消融实验不修改代码。
+    gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
+    info(f"*** GOP Size Config: {gop_size_cfg} ***\n")
+    h1.popen(f'{sender_bin} 10.0.1.2 12345 {video_trace} {preempt_cfg} {gop_size_cfg} > send.log 2>&1', shell=True, cwd=cwd)
 
     # 启动带抖动的链路更新线程
     log_csv = os.path.join(cwd, "link_metrics.csv")
@@ -545,10 +557,11 @@ def run():
         plot_img = os.path.join(cwd, "link_metrics_plot.png")
         plot_metrics(log_csv, plot_img)
 
-        # I帧优先机制测试：归档本次运行产物（消融对比用）
+        # I帧优先机制测试：归档本次运行产物（消融对比用），
+        # 标签含抢占开关与 GOP 间隔，便于区分不同消融组合。
         run_tag = os.environ.get("RUN_TAG", None)
         if run_tag is None:
-            run_tag = ("cfg_" + preempt_cfg
+            run_tag = ("cfg_" + preempt_cfg + "_gop" + gop_size_cfg
                        + "_" + time.strftime("%Y%m%d_%H%M%S"))
         archive_run(cwd, run_tag)
 
