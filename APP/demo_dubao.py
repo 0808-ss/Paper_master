@@ -13,7 +13,7 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 
 # sudo mn -c
-# sudo python3 demo_with_jitter.py
+# sudo python3 demo_dubao.py
 
 # ================= 配置参数 =================
 
