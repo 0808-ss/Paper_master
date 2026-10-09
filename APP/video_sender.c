@@ -494,16 +494,47 @@ static void parse_gop_size_config(const char* cfg, uint32_t* gop_size)
     }
 }
 
+/*
+ * 多路径调度器配置解析：第 6 个命令行参数，取值：
+ *   - default：picoquic 默认选路（min-RTT ACK + 亲和 + 最近未用，原版行为）
+ *   - rr     ：Round Robin，按路径索引轮询选择可用路径
+ *   - minrtt ：始终选择 rtt_min 最小的可用路径
+ * 解析失败或未知取值时使用默认（default）。
+ */
+static void parse_scheduler_config(const char* cfg, picoquic_multipath_scheduler_enum* scheduler)
+{
+    *scheduler = picoquic_multipath_scheduler_default;
+    if (cfg == NULL) return;
+
+    if (strcmp(cfg, "rr") == 0) {
+        *scheduler = picoquic_multipath_scheduler_rr;
+    } else if (strcmp(cfg, "minrtt") == 0) {
+        *scheduler = picoquic_multipath_scheduler_minrtt;
+    } else if (strcmp(cfg, "default") != 0) {
+        printf("[SCHED] Warning: unknown scheduler '%s', using default\n", cfg);
+    }
+}
+
+static const char* scheduler_name(picoquic_multipath_scheduler_enum scheduler)
+{
+    switch (scheduler) {
+    case picoquic_multipath_scheduler_rr: return "rr";
+    case picoquic_multipath_scheduler_minrtt: return "minrtt";
+    default: return "default";
+    }
+}
+
 int main(int argc, char** argv)
 {
     setbuf(stdout, NULL);
 
     if (argc < 4) {
-        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_enabled] [gop_size]\n", argv[0]);
+        printf("Usage: %s <server_ip> <port> <trace_file> [preempt_enabled] [gop_size] [scheduler]\n", argv[0]);
         printf("  preempt_enabled (可选): 0 = 基线(机制关) / 1 = 启用 I/BP 帧抢占（默认）\n");
         printf("  gop_size (可选): I 帧间隔帧数，帧索引为 gop_size 整数倍 => I 帧；\n");
         printf("                  0 = 全 BP（无 I 帧标记）；默认 %u（video_common.h 的 GOP_SIZE）\n",
             (unsigned int)GOP_SIZE);
+        printf("  scheduler (可选): default / rr / minrtt（多路径数据包选路策略，默认 default=原版行为）\n");
         return 1;
     }
 
@@ -611,6 +642,16 @@ int main(int argc, char** argv)
     picoquic_set_frame_preemption(cnx, pe);
     printf("[PREEMPT] frame-preemption cfg='%s' -> enabled=%d\n",
         (preempt_cfg ? preempt_cfg : "(default)"), pe);
+
+    /* 多路径调度器选择（第 6 个参数）：default / rr / minrtt。
+     * 只影响数据包在多路径间的选路，路径校验、ACK 与拥塞控制均不受影响；
+     * 单路径连接下本设置无效。 */
+    const char* sched_cfg = (argc > 6) ? argv[6] : NULL;
+    picoquic_multipath_scheduler_enum scheduler = picoquic_multipath_scheduler_default;
+    parse_scheduler_config(sched_cfg, &scheduler);
+    picoquic_set_multipath_scheduler(cnx, scheduler);
+    printf("[SCHED] multipath scheduler cfg='%s' -> %s\n",
+        (sched_cfg ? sched_cfg : "(default)"), scheduler_name(scheduler));
 
     if (picoquic_start_client_cnx(cnx) != 0) {
         fprintf(stderr, "Could not start client connection\n");

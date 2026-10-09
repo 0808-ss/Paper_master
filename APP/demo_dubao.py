@@ -45,6 +45,15 @@ PREEMPT_CONFIG = "1"
 # 可用环境变量 GOP_SIZE_CFG 覆盖（便于不同 GOP 间隔的消融实验不修改代码）。
 GOP_SIZE_CONFIG = "30"
 
+# 多路径数据包调度策略（多路径选路）：传给 video_sender 第 6 个参数。
+#   default = picoquic 原版选路（min-RTT ACK + 流亲和 + 最近未用，机制不生效）
+#   rr      = Round Robin：按路径索引轮询选择可用路径
+#   minrtt  = 最小 RTT：始终选择 rtt_min 最小的可用路径
+# 只影响数据包在多路径间的选路，不影响路径校验、ACK 与拥塞控制；
+# 单路径连接下该配置无效。
+# 可用环境变量 SCHEDULER_CFG 覆盖（便于不修改代码跑不同调度策略实验）。
+SCHEDULER_CONFIG = "default"
+
 # 实验归档标签：每次运行结束后把 qlog_sender/qlog_receiver/send.log/recv.log/
 # link_metrics.csv 归档到 runs/<RUN_TAG>_<时间戳>/，避免消融对比时被下次运行覆盖。
 # 可用环境变量 RUN_TAG 覆盖；不设置时自动按抢占配置与 GOP 间隔命名。
@@ -529,7 +538,12 @@ def run():
     # 支持环境变量 GOP_SIZE_CFG 覆盖，便于不同 GOP 间隔的消融实验不修改代码。
     gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
     info(f"*** GOP Size Config: {gop_size_cfg} ***\n")
-    h1.popen(f'{sender_bin} 10.0.1.2 12345 {video_trace} {preempt_cfg} {gop_size_cfg} > send.log 2>&1', shell=True, cwd=cwd)
+
+    # 多路径调度策略透传给 video_sender（第 6 个参数）：
+    # default / rr / minrtt，支持环境变量 SCHEDULER_CFG 覆盖。
+    scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
+    info(f"*** Multipath Scheduler Config: {scheduler_cfg} ***\n")
+    h1.popen(f'{sender_bin} 10.0.1.2 12345 {video_trace} {preempt_cfg} {gop_size_cfg} {scheduler_cfg} > send.log 2>&1', shell=True, cwd=cwd)
 
     # 启动带抖动的链路更新线程
     log_csv = os.path.join(cwd, "link_metrics.csv")
@@ -558,10 +572,11 @@ def run():
         plot_metrics(log_csv, plot_img)
 
         # I帧优先机制测试：归档本次运行产物（消融对比用），
-        # 标签含抢占开关与 GOP 间隔，便于区分不同消融组合。
+        # 标签含抢占开关、GOP 间隔与调度策略，便于区分不同消融组合。
         run_tag = os.environ.get("RUN_TAG", None)
         if run_tag is None:
             run_tag = ("cfg_" + preempt_cfg + "_gop" + gop_size_cfg
+                       + "_" + scheduler_cfg
                        + "_" + time.strftime("%Y%m%d_%H%M%S"))
         archive_run(cwd, run_tag)
 
