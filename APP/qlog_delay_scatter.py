@@ -2,7 +2,8 @@
 """
 qlog_delay_scatter.py — 依据 qlog 直接生成帧延迟 / 包延迟散点图
 
-本脚本完全只依赖 qlog，不需要 send.log / recv.log：
+网络层匹配和覆盖检查依赖 qlog；配套 send.log/recv.log 用于帧分类、
+预期长度、应用完整性及端到端时延：
   - qlog_sender/*.qlog     发送端日志（packet_sent 事件，含 stream frame 归因）
   - qlog_receiver/*.qlog   接收端日志（packet_received 事件）
 
@@ -11,12 +12,15 @@ qlog_delay_scatter.py — 依据 qlog 直接生成帧延迟 / 包延迟散点图
      因此按 stream id 分组即得帧级数据。
   2. 包匹配键 = (path_id, packet_number)。picoquic 的包号在每条路径上独立编号，
      必须联合 path_id 才能唯一匹配发送端 packet_sent 与接收端 packet_received。
-  3. 两端 qlog 的 reference_time 基准不同。自动对齐方式：
+  3. 默认同机 Mininet 时钟：使用两端 reference_time 还原共同时间轴。
+     如显式指定 --clock-mode min-owd，采用旧的相对时延口径：
        offset = min_over_matched(recv_rel - send_rel) - min_owd_us
      取所有匹配包中 (接收相对时间 - 发送相对时间) 的最小值作为时钟偏移基线；
      若已知链路真实最小单向延迟，用 --min-owd-us 校正（默认 0）。
   4. 包延迟 = (接收相对时间 - 发送相对时间) - offset。
-  5. 帧延迟 = 帧最后一个包到达时间 - 帧第一个包发送时间（同一基准下）。
+  5. 只有收到 FIN 且字节区间完整覆盖的流进入帧延迟图。
+     帧网络延迟 = 完整收流时间 - 首次发送时间（包括丢失的首发包）。
+     有配套应用日志时，另外输出 FRAME_GEN 到验证后 FRAME_RECV 的延迟。
 
 路径标记（默认，可用 --path-labels 或 make_path_labels() 动态调整）：
   picoquic path 0            -> "Path 1"（蓝）
@@ -460,9 +464,92 @@ def extract_stream_frames(data):
             continue
         if f.get("frame_type") != "stream":
             continue
-        frames.append((f.get("id"), f.get("offset", 0), f.get("length", 0),
-                       f.get("fin", False)))
+        if f.get("id") is None:
+            continue
+        frames.append((int(f['id']), int(f.get("offset", 0)), int(f.get("length", 0)),
+                       f.get("fin") in (True, 1, 'true', '1')))
     return frames
+
+
+def load_frame_metadata(send_log, recv_log):
+    """配套应用日志提供预期长度、产生时刻及应用完成校验。"""
+    metadata, generated, received = {}, {}, {}
+    if send_log and os.path.isfile(send_log):
+        with open(send_log, encoding='utf-8', errors='ignore') as fp:
+            for line in fp:
+                m = re.search(r'\[FRAME_GEN\] frame=(\d+).*gen_ts=(\d+)', line)
+                if m:
+                    generated[int(m[1])] = int(m[2])
+                m = re.search(r'\[STREAM_MAP\] stream=(\d+) frame=(\d+).*stream_len=(\d+) class=(\S+)', line)
+                if m:
+                    metadata[int(m[1])] = {'frame_id': int(m[2]), 'expected_bytes': int(m[3]),
+                                           'is_iframe': m[4] == 'I'}
+    if recv_log and os.path.isfile(recv_log):
+        with open(recv_log, encoding='utf-8', errors='ignore') as fp:
+            for line in fp:
+                m = re.search(r'\[FRAME_RECV\] frame=(\d+).*stream=(\d+) total_pkts=(\d+) recv_pkts=(\d+) size=(\d+) recv_ts=(\d+)', line)
+                if m:
+                    received[int(m[2])] = {'frame_id': int(m[1]), 'total_pkts': int(m[3]),
+                                          'recv_pkts': int(m[4]), 'size': int(m[5]), 'time': int(m[6])}
+    for sid, info in metadata.items():
+        info['gen_ts'] = generated.get(info['frame_id'])
+        receipt = received.get(sid)
+        info['app_complete'] = bool(receipt and receipt['frame_id'] == info['frame_id']
+            and receipt['size'] == info['expected_bytes'] and receipt['total_pkts'] > 0
+            and receipt['total_pkts'] == receipt['recv_pkts']) if recv_log and os.path.isfile(recv_log) else None
+        info['app_recv_ts'] = receipt['time'] if info['app_complete'] else None
+    return metadata
+
+
+def stream_receipt_status(spkt, rpkt, offset, metadata):
+    """按字节区间去重；没有 FIN 或覆盖有缺口的流不能计为完成帧。"""
+    states = {sid: {'expected_bytes': info['expected_bytes']} for sid, info in metadata.items()}
+    for _key, (when, data) in spkt.items():
+        for sid, off, length, fin in extract_stream_frames(data):
+            st = states.setdefault(sid, {})
+            st['send_first'] = min(st.get('send_first', when), when)
+            st['send_last'] = max(st.get('send_last', when), when)
+            st['sent_extent'] = max(st.get('sent_extent', 0), off + length)
+            if fin:
+                st['sent_fin'] = off + length
+    for key, (when, data) in rpkt.items():
+        for sid, off, length, fin in extract_stream_frames(data):
+            st = states.setdefault(sid, {})
+            st.setdefault('segments', []).append((when - offset, off, off + length, fin))
+            st.setdefault('received_packets', set()).add(key)
+    for sid, st in states.items():
+        expected = st.get('expected_bytes', st.get('sent_fin'))
+        st['expected_bytes'] = expected
+        intervals = []
+        final_size = None
+        st['complete_time'] = None
+        st['fin_consistent'] = True
+        for when, lo, hi, fin in sorted(st.get('segments', [])):
+            if fin:
+                if final_size is not None and final_size != hi:
+                    st['fin_consistent'] = False
+                final_size = hi
+            if hi > lo:
+                intervals.append((lo, hi))
+                merged = []
+                for begin, end in sorted(intervals):
+                    if merged and begin <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((begin, end))
+                intervals = merged
+            extent = intervals[0][1] if intervals and intervals[0][0] == 0 else 0
+            if (st['complete_time'] is None and st['fin_consistent'] and final_size is not None
+                and (expected is None or expected == final_size) and extent == final_size):
+                st['complete_time'] = when
+        st['received_bytes'] = sum(hi - lo for lo, hi in intervals)
+        if (not st['fin_consistent'] or (final_size is not None and expected is not None and final_size != expected)
+            or (final_size is not None and any(hi > final_size for _lo, hi in intervals))):
+            st['complete_time'] = None
+        st['status'] = ('complete' if st['complete_time'] is not None else
+                        'partial' if st.get('received_packets') else
+                        'unreceived' if 'send_first' in st else 'not_sent')
+    return states
 
 
 # ============================================================
@@ -631,6 +718,9 @@ def main():
     parser.add_argument("--outdir", default=None, help="输出目录（默认：脚本所在目录）")
     parser.add_argument("--min-owd-us", type=int, default=0,
                         help="链路最小单向延迟(us)，用于时钟对齐校正，默认 0")
+    parser.add_argument("--clock-mode", choices=('same-clock', 'min-owd'), default='same-clock',
+                        help="默认同机 Mininet 用 reference_time；跨机旧口径须显式选 min-owd")
+    parser.add_argument("--recv-log", default=None, help="配套 recv.log，用于验证应用完整性")
     parser.add_argument("--paths", default=None,
                         help="参与绘图的路径（qlog 原始 path_id，逗号分隔，如 0,2；"
                              "默认标记下 0=Path 1、1/2=Path 2）；默认全部")
@@ -668,28 +758,44 @@ def main():
 
     sref, sev = load_qlog(sender_path)
     rref, rev = load_qlog(receiver_path)
-    _ = (sref, rref)  # 对齐直接用两端相对时间差值，ref 之差在相减时抵消
 
     spkt = parse_1rtt_packets(sev, "packet_sent")
     rpkt = parse_1rtt_packets(rev, "packet_received")
     print("send 1RTT pkts:", len(spkt), " recv 1RTT pkts:", len(rpkt))
 
-    # ---- 时钟对齐：offset = min(recv_rel - send_rel) - min_owd_us ----
+    # ---- 同机 reference_time 对齐；min-owd 仅为显式兼容口径 ----
     # I帧优先机制测试：优先使用 send.log 中发送端显式标记的帧类，
     # 缺失时回退到 --iframe-pkts 包数启发式。
-    class_map = load_class_map(args.class_map or os.path.join(base_dir, "send.log"))
+    # 历史归档日志必须来自指定 sender qlog 所属轮次。
+    sender_dir = os.path.dirname(os.path.abspath(sender_path))
+    receiver_dir = os.path.dirname(os.path.abspath(receiver_path))
+    run_dir = os.path.dirname(sender_dir) if os.path.basename(sender_dir) == 'qlog_sender' else sender_dir
+    recv_run_dir = os.path.dirname(receiver_dir) if os.path.basename(receiver_dir) == 'qlog_receiver' else receiver_dir
+    send_log = args.class_map or os.path.join(run_dir, "send.log")
+    recv_log = args.recv_log or os.path.join(recv_run_dir, "recv.log")
+    class_map = load_class_map(send_log)
+    metadata = load_frame_metadata(send_log, recv_log)
 
     raw_diffs = []
     for key, (srel, _) in spkt.items():
         if key in rpkt:
             raw_diffs.append(rpkt[key][0] - srel)
-    if not raw_diffs:
-        raise SystemExit("发送端与接收端没有匹配到任何 1RTT 包")
-    offset = min(raw_diffs) - args.min_owd_us
+    if args.clock_mode == 'same-clock':
+        if sref <= 0 or rref <= 0:
+            raise SystemExit("same-clock requires nonzero reference_time in both qlogs")
+        if args.min_owd_us != 0:
+            raise SystemExit("--min-owd-us requires --clock-mode min-owd")
+        offset = sref - rref
+        if any(diff - offset < 0 for diff in raw_diffs):
+            raise SystemExit("Negative OWD under same-clock: check qlog pairing/clock origin; use min-owd only for explicit legacy analysis")
+    else:
+        if not raw_diffs:
+            raise SystemExit("min-owd cannot align clocks without matched packets; same-clock can export missing frames")
+        offset = min(raw_diffs) - args.min_owd_us
     print("matched pkts:", len(raw_diffs),
-          " raw min diff(us):", min(raw_diffs),
+          " raw min diff(us):", min(raw_diffs) if raw_diffs else None,
           " -> offset(us):", offset,
-          " (assumed min OWD:", args.min_owd_us, "us)")
+          " clock-mode:", args.clock_mode)
 
     # ---- 包级数据 ----
     packets = []
@@ -702,9 +808,9 @@ def main():
                 "path_id": path_id,
                 "pn": pn,
                 "send_rel": srel,
-                "recv_abs": rrel,
+                "recv_abs": rrel - offset,
                 "delay_us": rrel - srel - offset,
-                "stream_ids": [s[0] for s in streams],
+                "stream_ids": sorted({s[0] for s in streams}),
             })
         else:
             send_only += 1
@@ -716,19 +822,16 @@ def main():
         for sid in pk["stream_ids"]:
             by_stream[sid].append(pk)
 
-    # 预统计每个 stream 的总字节数（含未匹配包）
-    stream_bytes = defaultdict(int)
-    for (_path_id, _pn), (_srel, sdata) in spkt.items():
-        for sid2, off, ln, _fin in extract_stream_frames(sdata):
-            if sid2 + 1 > 0:
-                stream_bytes[sid2] = max(stream_bytes[sid2], off + ln)
+    states = stream_receipt_status(spkt, rpkt, offset, metadata)
 
     frames = []
-    for sid in sorted(by_stream.keys()):
+    for sid, st in sorted(states.items()):
+        if st['status'] != 'complete' or 'send_first' not in st or not by_stream[sid]:
+            continue
         pks = by_stream[sid]
-        send_first = min(p["send_rel"] for p in pks)
-        send_last = max(p["send_rel"] for p in pks)
-        recv_last = max(p["recv_abs"] for p in pks)
+        send_first = st['send_first']
+        send_last = st['send_last']
+        recv_last = st['complete_time']
         path_counts = defaultdict(int)
         for p in pks:
             path_counts[p["path_id"]] += 1
@@ -738,15 +841,22 @@ def main():
             "send_first_us": send_first,
             "send_last_us": send_last,
             "recv_last_us": recv_last,
-            "frame_delay_us": recv_last - send_first - offset,
+            "frame_delay_us": recv_last - send_first,
             "npkts": len(pks),
-            "nbytes": stream_bytes.get(sid, 0),
+            "nbytes": st['received_bytes'],
+            "app_complete": metadata.get(sid, {}).get('app_complete'),
+            "end_to_end_us": ((metadata[sid]['app_recv_ts'] - metadata[sid]['gen_ts'])
+                              if args.clock_mode == 'same-clock' and sid in metadata
+                              and metadata[sid].get('app_recv_ts') is not None
+                              and metadata[sid].get('gen_ts') is not None else None),
             "pkts_by_path": dict(path_counts),
             "main_path": main_path,
             "is_iframe": class_map.get(sid, len(pks) > args.iframe_pkts),
         })
     n_iframe = sum(1 for f in frames if f["is_iframe"])
     print("frames:", len(frames), " I-frames:", n_iframe)
+    print("stream status counts:", {status: sum(st['status'] == status for st in states.values())
+                                     for status in ('complete', 'partial', 'unreceived', 'not_sent')})
 
     # ---- 路径过滤（qlog 原始 path_id）----
     paths = (sorted(int(x) for x in args.paths.split(",")) if args.paths
@@ -774,6 +884,17 @@ def main():
     outdir = args.outdir or base_dir
     if not os.path.isdir(outdir):
         os.makedirs(outdir)
+    status_csv = os.path.join(outdir, 'qlog_frame_status.csv')
+    with open(status_csv, 'w', newline='', encoding='utf-8-sig') as fp:
+        writer = csv.DictWriter(fp, fieldnames=['stream_id', 'frame_id', 'status', 'expected_bytes',
+                                                'received_bytes', 'app_complete'])
+        writer.writeheader()
+        for sid, st in sorted(states.items()):
+            writer.writerow({'stream_id': sid, 'frame_id': metadata.get(sid, {}).get('frame_id'),
+                             'status': st['status'], 'expected_bytes': st['expected_bytes'],
+                             'received_bytes': st['received_bytes'],
+                             'app_complete': metadata.get(sid, {}).get('app_complete')})
+    print('wrote:', status_csv)
 
     pkt_csv = os.path.join(outdir, "qlog_packet_delay.csv")
     with open(pkt_csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -793,7 +914,7 @@ def main():
     fr_csv = os.path.join(outdir, "qlog_frame_delay.csv")
     ordered = ordered_labels(labels)
     fr_fields = (["stream_id", "send_first_us", "send_last_us", "recv_last_us",
-                  "frame_delay_us", "npkts", "nbytes"]
+                  "frame_delay_us", "npkts", "nbytes", "app_complete", "end_to_end_us"]
                  + ["%s_pkts" % label_token(lab) for lab in ordered]
                  + ["main_path", "is_iframe"])
     with open(fr_csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -802,7 +923,7 @@ def main():
         for fr in frames:
             row = {k: fr[k] for k in ("stream_id", "send_first_us", "send_last_us",
                                       "recv_last_us", "frame_delay_us", "npkts",
-                                      "nbytes", "is_iframe")}
+                                      "nbytes", "is_iframe", "app_complete", "end_to_end_us")}
             for lab in ordered:
                 raw_ids = [r for r, l in labels.items() if l == lab]
                 row["%s_pkts" % label_token(lab)] = sum(

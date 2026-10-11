@@ -3,6 +3,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <picoquic.h>
+#include <picoquic_internal.h>
 #include <picoquic_utils.h>
 #include <picosocks.h>
 #include <stdio.h>
@@ -36,7 +37,7 @@
 
 /*
  * UDP 自定义首部格式（放在每个 UDP 报文前）
- * 所有 UDP 报文统一加首部，包括握手、探测、ACK、关闭阶段。
+ * 发送端发出的所有 UDP 报文加首部；接收端反向报文保持原生 QUIC 格式。
  * 头部 16 字节：
  *   [ send_ts_us     (uint64) ]
  *   [ global_pkt_seq (uint32) ]
@@ -51,12 +52,11 @@
  * stream 数据会被直接丢弃（这就是 4K 负载下接收端只收到 150/349 帧的根因）。
  * 因此进入排空阶段：继续收发，直到 QUIC 层不再有待发送/待重传/待确认的数据，再关闭。
  *
- * 判定依据：picoquic_get_next_wake_delay() 返回下一次必须唤醒的时间间隔——
- *   还有待发送数据时返回 0/极小值；还有已发送未确认数据时返回重传定时点（短）；
- *   数据全部确认后返回空闲/idle 长间隔。连续多次观察到长间隔，即判定排空完成。
+ * 判定依据：应用 chunk、I/BP 暂存、输出流数据/FIN、重传区间队列均为空，
+ * 且 picoquic_is_cnx_backlog_empty 确认不存在需要重传的在途报文。
+ * 下一次唤醒时间只用于轮询等待，不再作为完成条件。
  */
-#define DRAIN_IDLE_THRESHOLD_US 500000   /* 单次"空闲间隔"阈值：0.5s 内无任何发送/重传任务 */
-#define DRAIN_STREAK_REQUIRED 3          /* 连续空闲次数（共需约 1.5s 稳定空闲） */
+#define VIDEO_START_DELAY_US 200000     /* 共同时间轴起点，给链路线程读取启动记录的时间 */
 #define DRAIN_TIMEOUT_US 60000000        /* 排空超时：60s，防止对端失联时无限等待 */
 #define DRAIN_SELECT_POLL_US 250000      /* select 轮询间隔上限：空闲时每 250ms 检查一次，
                                             避免按完整 idle-timeout(最长10s) 阻塞而拖慢判定 */
@@ -226,7 +226,8 @@ static int sender_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_ready:
         printf("Connection established. Starting video stream.\n");
         ctx->is_connected = 1;
-        ctx->next_send_time = picoquic_current_time();
+        ctx->next_send_time = picoquic_current_time() + VIDEO_START_DELAY_US;
+        printf("[VIDEO_START] monotonic_us=%" PRIu64 "\n", ctx->next_send_time);
 
         if (ctx->active_path_count == 0) {
             ctx->active_paths[ctx->active_path_count++] = 0;
@@ -524,6 +525,21 @@ static const char* scheduler_name(picoquic_multipath_scheduler_enum scheduler)
     }
 }
 
+/* backlog API only checks in-flight packets. Also check admission, unsent
+ * streams (including flow-control blocked ones), and queued retransmissions.
+ * This APP deliberately uses the pinned local picoquic internal layout. */
+static int video_send_queue_empty(picoquic_cnx_t* cnx)
+{
+    if (cnx->frame_queue_i != NULL || cnx->frame_queue_bp != NULL ||
+        picosplay_first(&cnx->queue_data_repeat_tree) != NULL) return 0;
+    for (picoquic_stream_head_t* stream = cnx->first_output_stream;
+        stream != NULL; stream = stream->next_output_stream) {
+        if (stream->send_queue != NULL || stream->is_active ||
+            (stream->fin_requested && !stream->fin_sent)) return 0;
+    }
+    return picoquic_is_cnx_backlog_empty(cnx);
+}
+
 int main(int argc, char** argv)
 {
     setbuf(stdout, NULL);
@@ -540,6 +556,7 @@ int main(int argc, char** argv)
 
     const char* server_ip = argv[1];
     int port = atoi(argv[2]);
+    int exit_status = 0;
     const char* trace_file = argv[3];
 
     /* I帧优先机制测试：GOP 间隔（第 5 个参数，默认 video_common.h 的 GOP_SIZE） */
@@ -808,6 +825,9 @@ int main(int argc, char** argv)
         if (app_ctx.next_send_time > current_time) {
             int64_t wait_frame = app_ctx.next_send_time - current_time;
             if (wait_frame < delta_t) delta_t = wait_frame;
+        } else if (app_ctx.is_connected && app_ctx.current_frame_idx < app_ctx.frame_count) {
+            /* 到期帧尚未生成时，不得再等待 QUIC 的长重传/空闲计时器。 */
+            delta_t = 0;
         }
 
         struct sockaddr_storage peer_addr;
@@ -887,7 +907,7 @@ int main(int argc, char** argv)
     if (app_ctx.current_frame_idx >= app_ctx.frame_count && !app_ctx.is_disconnected) {
         printf("Video trace finished. Draining QUIC send queue...\n");
 
-        int drain_streak = 0;
+        int drained = 0;
         uint64_t drain_start = current_time;
         uint64_t last_progress_print = 0;
 
@@ -963,24 +983,19 @@ int main(int argc, char** argv)
                 }
             }
 
-            /* 排空完成判定：本轮无任何发送任务，且下一次唤醒间隔足够长，
-             * 说明 QUIC 既无待发送数据、也无待重传/待确认数据（已全部被对端确认） */
-            if (!sent_any && delta_t >= DRAIN_IDLE_THRESHOLD_US) {
-                drain_streak++;
-                if (drain_streak >= DRAIN_STREAK_REQUIRED) {
-                    printf("[DRAIN] QUIC send queue drained after %lu us (frames %d/%d).\n",
-                        current_time - drain_start, app_ctx.current_frame_idx, app_ctx.frame_count);
-                    break;
-                }
-            } else {
-                drain_streak = 0;
+            /* 长计时器/流控阻塞不等于完成：检查实际待传和待确认队列。 */
+            if (chunk_queue_count == 0 && video_send_queue_empty(cnx)) {
+                drained = 1;
+                printf("[DRAIN] QUIC send queue drained after %lu us (frames %d/%d).\n",
+                    current_time - drain_start, app_ctx.current_frame_idx, app_ctx.frame_count);
+                break;
             }
 
             /* 排空进度打印（每 2s） */
             if (current_time > last_progress_print + 2000000) {
                 last_progress_print = current_time;
-                printf("[DRAIN] still draining, elapsed=%lu us, streak=%d, next_wake=%lld us\n",
-                    current_time - drain_start, drain_streak, (long long)delta_t);
+                printf("[DRAIN] still draining, elapsed=%lu us, sent_any=%d, next_wake=%lld us\n",
+                    current_time - drain_start, sent_any, (long long)delta_t);
             }
 
             /* 超时保护：对端失联/链路中断等异常时强制关闭，避免无限等待 */
@@ -991,9 +1006,12 @@ int main(int argc, char** argv)
             }
         }
 
+        if (!drained) exit_status = 1;
+
         printf("Video trace finished. Closing connection.\n");
         picoquic_close(cnx, 0);
     } else {
+        exit_status = 1;
         printf("Sender loop ended early. progress=%d/%d (disconnected=%d)\n",
             app_ctx.current_frame_idx, app_ctx.frame_count, app_ctx.is_disconnected);
     }
@@ -1063,5 +1081,5 @@ int main(int argc, char** argv)
     picoquic_free(quic);
     free(app_ctx.frames);
     free(packet_buffer);
-    return 0;
+    return exit_status;
 }

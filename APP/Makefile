@@ -28,13 +28,16 @@ LIBS = -Wl,--start-group \
        -lm
 
 TARGETS = video_receiver video_sender
+PICOQUIC_HEADERS = ../picoquic/picoquic/picoquic.h \
+                   ../picoquic/picoquic/picoquic_internal.h
+PICOQUIC_LIBS = ../picoquic/libpicoquic-core.a ../picoquic/libpicoquic-log.a
 
 all: $(TARGETS)
 
-video_receiver: video_receiver.c video_common.h
+video_receiver: video_receiver.c video_common.h $(PICOQUIC_HEADERS) $(PICOQUIC_LIBS)
 	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS) $(LIBS)
 
-video_sender: video_sender.c video_common.h
+video_sender: video_sender.c video_common.h $(PICOQUIC_HEADERS) $(PICOQUIC_LIBS)
 	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS) $(LIBS)
 
 clean:

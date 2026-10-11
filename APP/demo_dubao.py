@@ -7,6 +7,12 @@ import shutil
 import subprocess
 import threading
 import random
+import bisect
+import re
+import shlex
+import signal
+import json
+import hashlib
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.link import TCLink
@@ -59,15 +65,14 @@ SCHEDULER_CONFIG = "default"
 # 可用环境变量 RUN_TAG 覆盖；不设置时自动按抢占配置与 GOP 间隔命名。
 RUN_TAG = ""
 
-# 初始化随机种子
-random.seed(RANDOM_SEED)
+# 每次实验使用独立 RNG，在启动网络负载前生成抖动序列。
 
 # ================= 数据读取与查询逻辑 =================
 
 def load_video_trace(filepath):
     """读取视频文件以获取帧调度定时"""
     frame_times = []
-    current_time = 0.0
+    current_time_us = 0
     try:
         with open(filepath, 'r') as f:
             for line in f:
@@ -75,8 +80,14 @@ def load_video_trace(filepath):
                 parts = line.split(',')
                 if len(parts) >= 2:
                     try:
-                        current_time += float(parts[1])
-                        frame_times.append(current_time)
+                        if int(parts[0]) <= 0:
+                            raise ValueError("frame size must be positive")
+                        wait_us = int(float(parts[1]) * 1000000)
+                        if wait_us < 0:
+                            raise ValueError("negative frame interval")
+                        # C 在 ready 后的共同起点立即生成第一帧，然后等待前一帧间隔。
+                        frame_times.append(current_time_us / 1000000.0)
+                        current_time_us += wait_us
                     except ValueError:
                         continue
     except Exception as e:
@@ -152,7 +163,7 @@ def get_nearest_values(grid, x, y, z):
     min_dist = float('inf')
     best_thr, best_lat = 50.0, 10.0
     for pt in grid:
-        dist = math.sqrt((pt['x']-x)**2 + (pt['y']-y)**2 + (pt['z']-z)**2)
+        dist = (pt['x']-x)**2 + (pt['y']-y)**2 + (pt['z']-z)**2
         if dist < min_dist:
             min_dist = dist
             best_thr = pt['thr']
@@ -161,26 +172,41 @@ def get_nearest_values(grid, x, y, z):
     best_thr = max(1.0, best_thr)
     return best_thr, best_lat
 
-# ================= 平滑更新 TC 的辅助函数（终极通用版） =================
+# ================= TC 初始化与原位更新 =================
 
-def safe_update_tc(intf, bw_mbps, delay_str):
-    """
-    终极通用TC更新函数，兼容所有Mininet版本
-    不依赖任何硬编码的类ID，直接重建整个TC配置
-    """
-    node = intf.node
-    ifname = intf.name
-    
-    # 第一步：完全删除接口上所有现有的TC配置
-    node.cmd(f'tc qdisc del dev {ifname} root 2>/dev/null || true')
-    
-    # 第二步：从头创建我们自己的标准TC配置
-    # 根qdisc: HTB
-    node.cmd(f'tc qdisc add dev {ifname} root handle 1: htb default 1')
-    # 主类: 限制带宽
-    node.cmd(f'tc class add dev {ifname} parent 1: classid 1:1 htb rate {bw_mbps}mbit ceil {bw_mbps}mbit')
-    # 附加netem: 添加延迟和抖动
-    node.cmd(f'tc qdisc add dev {ifname} parent 1:1 handle 10: netem delay {delay_str}')
+def checked_tc(intf, command):
+    output = intf.node.cmd(command + '; printf "\\n__TC_RC__%s\\n" "$?"')
+    marker = re.search(r"__TC_RC__(\d+)\s*$", output)
+    if not marker or int(marker.group(1)) != 0:
+        raise RuntimeError(f"TC command failed on {intf.name}: {command}: {output}")
+
+
+def safe_update_tc(intf, bw_mbps, delay_str, initialize=False):
+    """启动负载前创建固定句柄；运行中只 change，保留排队报文。"""
+    ifname = shlex.quote(intf.name)
+    if initialize:
+        checked_tc(intf, f'tc qdisc replace dev {ifname} root handle 1: htb default 1')
+    action = 'add' if initialize else 'change'
+    checked_tc(intf, f'tc class {action} dev {ifname} parent 1: classid 1:1 '
+               f'htb rate {bw_mbps}mbit ceil {bw_mbps}mbit')
+    checked_tc(intf, f'tc qdisc {action} dev {ifname} parent 1:1 handle 10: '
+               f'netem limit 1000 delay {delay_str}')
+
+
+def precompute_link_trace(trace, ground_grid, sky_grid):
+    """最近点扫描只在负载启动前执行，不占用回放的更新时间预算。"""
+    if not trace or not ground_grid or not sky_grid:
+        raise ValueError("Travel/ground/sky input data must not be empty")
+    if any(b['time'] <= a['time'] for a, b in zip(trace, trace[1:])):
+        raise ValueError("Travel timestamps must be strictly increasing")
+    prepared = []
+    for pt in trace:
+        g = get_nearest_values(ground_grid, pt['x'], pt['y'], pt['z'])
+        s = get_nearest_values(sky_grid, pt['x'], pt['y'], pt['z'])
+        if not all(math.isfinite(v) and v >= 0 for v in (*g, *s)):
+            raise ValueError("non-finite or negative link parameter")
+        prepared.append(dict(pt, ground_bw=g[0], ground_lat=g[1], sky_bw=s[0], sky_lat=s[1]))
+    return prepared
 
 # ================= Mininet 拓扑设计 =================
 
@@ -203,120 +229,86 @@ class MPQUICVideoTopo(Topo):
 
 # ================= 动态链路更新线程（带抖动） =================
 
-def dynamic_link_updater_with_jitter(net, trace, ground_grid, sky_grid, frame_times, stop_event,
-                                      granularity=0.01, jitter_prob=JITTER_PROBABILITY,
-                                      jitter_delays=JITTER_DELAYS, log_file=None):
-    """定期更新底层链路参数，并在帧调度时添加随机时延抖动"""
-    info("*** Starting Dynamic Link Updater with Jitter (Frame-triggered) ***\n")
-    info(f"*** Random Seed: {RANDOM_SEED}, Jitter Probability: {jitter_prob}\n")
-
-    start_time = time.time()
-
-    # 打开数据记录文件
-    log_fp = None
-    if log_file:
-        log_fp = open(log_file, 'w')
-        log_fp.write("time,ground_bw,ground_lat,ground_jitter,sky_bw,sky_lat,sky_jitter\n")
-
+def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_event,
+                                      sender_log, errors, timing_state, granularity=0.01,
+                                      log_file=None):
+    """在与 Linux picoquic 相同的 CLOCK_MONOTONIC 时间轴回放预计算参数。"""
+    rng = random.Random(RANDOM_SEED)
+    jitter = []
+    for _ in frame_times:
+        g = rng.choice(JITTER_DELAYS) if rng.random() < JITTER_PROBABILITY else 0
+        s = rng.choice(JITTER_DELAYS) if rng.random() < JITTER_PROBABILITY else 0
+        jitter.append((g, s))
     h1 = net.get('h1')
-    s1, s2 = net.get('s1'), net.get('s2')
-    s3, s4 = net.get('s3'), net.get('s4')
-    link1 = net.linksBetween(h1, s1)[0]
-    link2 = net.linksBetween(h1, s3)[0]
-
-    last_g_thr, last_g_lat = -1, -1
-    last_s_thr, last_s_lat = -1, -1
-
-    # 抖动状态：记录当前是否处于抖动状态及额外延迟
-    g_jitter_extra = 0
-    s_jitter_extra = 0
-
-    while not stop_event.is_set():
-        elapsed = time.time() - start_time
-
-        # 检查是否触发帧调度
-        frame_triggered = False
-        frames_popped = 0
-        while frame_times and elapsed >= frame_times[0]:
-            frame_triggered = True
-            frames_popped += 1
-            frame_times.pop(0)
-
-        # 查找当前轨迹点
-        current_pt = trace[-1]
-        for pt in trace:
-            if pt['time'] >= elapsed:
-                current_pt = pt
-                break
-
-        # 获取基础延迟值
-        g_thr, g_lat_base = get_nearest_values(ground_grid, current_pt['x'], current_pt['y'], current_pt['z'])
-        s_thr, s_lat_base = get_nearest_values(sky_grid, current_pt['x'], current_pt['y'], current_pt['z'])
-
-        # === 时延抖动逻辑 ===
-        # 在帧调度时计算是否发生抖动，如果发生则在当前时间段应用抖动
-        if frame_triggered:
-            # 严格按照弹出的帧数生成随机数，隔离线程调度的影响，保证每次实验随机序列一致
-            for _ in range(frames_popped):
-                if random.random() < jitter_prob:
-                    g_jitter_extra = random.choice(jitter_delays)
-                else:
-                    g_jitter_extra = 0
-
-                if random.random() < jitter_prob:
-                    s_jitter_extra = random.choice(jitter_delays)
-                else:
-                    s_jitter_extra = 0
-                    
-            if g_jitter_extra > 0:
-                info(f"[JITTER] Ground path delay +{g_jitter_extra}ms\n")
-            if s_jitter_extra > 0:
-                info(f"[JITTER] Sky path delay +{s_jitter_extra}ms\n")
-
-        # 计算实际延迟值
-        g_lat = g_lat_base + g_jitter_extra
-        s_lat = s_lat_base + s_jitter_extra
-
-        g_lat_str = f"{g_lat:.2f}ms" if g_lat > 0 else "0.1ms"
-        s_lat_str = f"{s_lat:.2f}ms" if s_lat > 0 else "0.1ms"
-
-        try:
-            updated = False
-            if abs(g_thr - last_g_thr) > 0.1 or abs(g_lat - last_g_lat) > 0.1:
-                safe_update_tc(link1.intf1, g_thr, g_lat_str)
-                safe_update_tc(link1.intf2, g_thr, g_lat_str)
-                last_g_thr, last_g_lat = g_thr, g_lat
-                updated = True
-
-            if abs(s_thr - last_s_thr) > 0.1 or abs(s_lat - last_s_lat) > 0.1:
-                safe_update_tc(link2.intf1, s_thr, s_lat_str)
-                safe_update_tc(link2.intf2, s_thr, s_lat_str)
-                last_s_thr, last_s_lat = s_thr, s_lat
-                updated = True
-
-            if updated:
-                jitter_g_info = f" (base {g_lat_base:.2f}ms + jitter {g_jitter_extra}ms)" if g_jitter_extra > 0 else ""
-                jitter_s_info = f" (base {s_lat_base:.2f}ms + jitter {s_jitter_extra}ms)" if s_jitter_extra > 0 else ""
-                info(f"[{elapsed:.2f}s] Link Updated at Pos:({current_pt['x']:.1f}, {current_pt['y']:.1f}, {current_pt['z']:.1f})\n"
-                     f"    -> Ground : BW={g_thr:.2f}Mbps, Latency={g_lat:.2f}ms{jitter_g_info}\n"
-                     f"    -> Sky    : BW={s_thr:.2f}Mbps, Latency={s_lat:.2f}ms{jitter_s_info}\n")
-
-            # 记录数据到CSV
-            if log_fp:
-                log_fp.write(f"{elapsed:.3f},{g_thr:.2f},{g_lat_base:.2f},{g_jitter_extra},"
-                            f"{s_thr:.2f},{s_lat_base:.2f},{s_jitter_extra}\n")
+    links = (net.linksBetween(h1, net.get('s1'))[0],
+             net.linksBetween(h1, net.get('s3'))[0])
+    trace_times = [pt['time'] for pt in prepared_trace]
+    first = prepared_trace[0]
+    previous = [(first['ground_bw'], max(0.1, first['ground_lat'])),
+                (first['sky_bw'], max(0.1, first['sky_lat']))]
+    deadline = time.monotonic() + 30.0
+    start_time = None
+    previous_frame = -1
+    reader = None
+    try:
+        # 发送端 ready 后公布未来 200 ms 的共同起点。旧二进制缺少标记时显式失败。
+        while not stop_event.is_set() and start_time is None:
+            if reader is None and os.path.exists(sender_log):
+                reader = open(sender_log, 'r')
+            if reader is not None:
+                for line in reader:
+                    match = re.search(r"\[VIDEO_START\] monotonic_us=(\d+)", line)
+                    if match:
+                        start_time = int(match.group(1)) / 1000000.0
+                        break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("No VIDEO_START marker within 30s; rebuild sender or check handshake")
+            if start_time is None:
+                stop_event.wait(0.005)
+        if start_time is None:
+            return
+        if stop_event.wait(max(0.0, start_time - time.monotonic())):
+            return
+        info(f"*** Link/video common origin: {start_time:.6f}s (monotonic) ***\n")
+        tick = 0
+        with open(log_file, 'w') as log_fp:
+            log_fp.write("time,ground_bw,ground_lat,ground_jitter,sky_bw,sky_lat,sky_jitter,"
+                         "applied_time,update_lag_ms,frames_skipped\n")
+            while not stop_event.is_set():
+                scheduled = tick * granularity
+                elapsed = time.monotonic() - start_time
+                # 保留旧 Travel 查询的 ceiling 采样规则，不改变数据集建模。
+                ti = min(bisect.bisect_left(trace_times, elapsed), len(prepared_trace) - 1)
+                pt = prepared_trace[ti]
+                fi = bisect.bisect_right(frame_times, elapsed) - 1
+                g_extra, s_extra = jitter[fi] if fi >= 0 else (0, 0)
+                skipped = max(0, fi - previous_frame - 1)
+                previous_frame = fi
+                timing_state['frames_skipped'] += skipped
+                values = [(pt['ground_bw'], max(0.1, pt['ground_lat'] + g_extra)),
+                          (pt['sky_bw'], max(0.1, pt['sky_lat'] + s_extra))]
+                for i, (bw, lat) in enumerate(values):
+                    if abs(bw - previous[i][0]) > 0.1 or abs(lat - previous[i][1]) > 0.1:
+                        for intf in (links[i].intf1, links[i].intf2):
+                            safe_update_tc(intf, bw, f"{lat:.2f}ms")
+                        previous[i] = (bw, lat)
+                applied = time.monotonic() - start_time
+                lag_ms = max(0.0, applied - scheduled) * 1000.0
+                timing_state['max_update_lag_ms'] = max(timing_state['max_update_lag_ms'], lag_ms)
+                log_fp.write(f"{elapsed:.6f},{pt['ground_bw']:.6f},{pt['ground_lat']:.6f},{g_extra},"
+                             f"{pt['sky_bw']:.6f},{pt['sky_lat']:.6f},{s_extra},"
+                             f"{applied:.6f},{lag_ms:.3f},{skipped}\n")
                 log_fp.flush()
-
-        except Exception as e:
-            info(f"Error updating link: {e}\n")
-
-        if elapsed > trace[-1]['time'] + granularity:
-            pass
-
-        time.sleep(granularity)
-
-    if log_fp:
-        log_fp.close()
+                # 使用绝对 tick，耗时不累积到下一次 sleep；迟到与跳帧写入归档。
+                tick = max(tick + 1, int(applied / granularity) + 1)
+                stop_event.wait(max(0.0, start_time + tick * granularity - time.monotonic()))
+    except Exception as exc:
+        errors.append(str(exc))
+        info(f"*** Link updater failed: {exc} ***\n")
+        stop_event.set()
+    finally:
+        if reader is not None:
+            reader.close()
 
 # ================= 绘制图表逻辑 =================
 
@@ -369,7 +361,9 @@ def archive_run(cwd, tag):
                           ("qlog_receiver", "qlog_receiver"),
                           ("send.log", "send.log"),
                           ("recv.log", "recv.log"),
-                          ("link_metrics.csv", "link_metrics.csv")):
+                          ("link_metrics.csv", "link_metrics.csv"),
+                          ("tc_state.log", "tc_state.log"),
+                          ("run_manifest.json", "run_manifest.json")):
         p = os.path.join(cwd, src)
         if os.path.isdir(p):
             shutil.copytree(p, os.path.join(run_dir, dst_name), dirs_exist_ok=True)
@@ -408,6 +402,12 @@ def run():
     trace_data = load_trace(trace_file)
     ground_grid = load_grid_data(ground_thr_path, ground_lat_path)
     sky_grid = load_grid_data(sky_thr_path, sky_lat_path)
+    video_trace = os.path.abspath(os.environ.get("VIDEO_TRACE", os.path.join(cwd, "4k_30f_trace_0.8.csv")))
+    frame_times = load_video_trace(video_trace)
+    if not frame_times:
+        raise ValueError("video trace must contain valid frames")
+    info("*** Precomputing Travel link parameters before starting traffic ***\n")
+    prepared_trace = precompute_link_trace(trace_data, ground_grid, sky_grid)
 
     topo = MPQUICVideoTopo()
     # 明确指定无控制器和自动设置MAC，避免任何干扰
@@ -512,73 +512,170 @@ def run():
     info("Testing Reverse path (h2 -> h1 via 10.0.2.0/24):\n")
     h2.cmdPrint('ping -c 2 -W 1 10.0.2.1')
 
-    info("*** Starting Receiver ***\n")
-    h2.cmd(f'cd {cwd} && rm -f recv.log')
-    h2.popen(f'{receiver_bin} 12345 {cert_file} {key_file} > recv.log 2>&1', shell=True, cwd=cwd)
-
-    time.sleep(1.0)  # 增加启动延迟，确保接收端完全就绪
-
-    stop_event = threading.Event()
-
-    info("*** Starting Sender ***\n")
-    h1.cmd(f'cd {cwd} && rm -f send.log')
-
-    video_trace = os.path.join(cwd, "4k_30f_trace_0.8.csv")
-    # video_trace = os.path.join(cwd, "output.csv")
-
-    info("*** Loading Video Frame Trace ***\n")
-    frame_times = load_video_trace(video_trace)
-
-    # I帧优先机制测试：抢占配置透传给 video_sender（第 4 个参数），
-    # 支持环境变量 PREEMPT_CFG 覆盖，便于消融实验不修改代码。
     preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
-    info(f"*** Preemption Config: {preempt_cfg} ***\n")
-
-    # I帧优先机制测试：GOP 间隔透传给 video_sender（第 5 个参数），
-    # 支持环境变量 GOP_SIZE_CFG 覆盖，便于不同 GOP 间隔的消融实验不修改代码。
     gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
-    info(f"*** GOP Size Config: {gop_size_cfg} ***\n")
-
-    # 多路径调度策略透传给 video_sender（第 6 个参数）：
-    # default / rr / minrtt，支持环境变量 SCHEDULER_CFG 覆盖。
     scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
-    info(f"*** Multipath Scheduler Config: {scheduler_cfg} ***\n")
-    h1.popen(f'{sender_bin} 10.0.1.2 12345 {video_trace} {preempt_cfg} {gop_size_cfg} {scheduler_cfg} > send.log 2>&1', shell=True, cwd=cwd)
-
-    # 启动带抖动的链路更新线程
+    stop_event = threading.Event()
+    errors = []
+    timing_state = {'frames_skipped': 0, 'max_update_lag_ms': 0.0}
     log_csv = os.path.join(cwd, "link_metrics.csv")
-    update_thread = threading.Thread(
-        target=dynamic_link_updater_with_jitter,
-        args=(net, trace_data, ground_grid, sky_grid, frame_times, stop_event, 0.01, JITTER_PROBABILITY, JITTER_DELAYS, log_csv)
-    )
-    update_thread.start()
-
-    info("*** Tailing Logs (Press Ctrl+C to Stop) ***\n")
+    sender_proc = receiver_proc = tail_proc = update_thread = None
+    send_fp = recv_fp = None
+    status = 'failed'
+    first = prepared_trace[0]
+    links = (net.linksBetween(h1, s1)[0], net.linksBetween(h1, s3)[0])
     try:
-        subprocess.run(["tail", "-f", os.path.join(cwd, "send.log"), os.path.join(cwd, "recv.log")])
+        # 初始化失败时也不得把上一轮的更新日志归档成本轮数据。
+        with open(log_csv, 'w'):
+            pass
+        send_fp = open(os.path.join(cwd, "send.log"), 'w')
+        recv_fp = open(os.path.join(cwd, "recv.log"), 'w')
+        # 只在握手/视频负载开始之前替换初始队列，之后不再 del/replace。
+        for link, bw, lat in ((links[0], first['ground_bw'], first['ground_lat']),
+                              (links[1], first['sky_bw'], first['sky_lat'])):
+            for intf in (link.intf1, link.intf2):
+                safe_update_tc(intf, bw, f"{max(0.1, lat):.2f}ms", initialize=True)
+        info("*** Starting Receiver ***\n")
+        receiver_proc = h2.popen([receiver_bin, '12345', cert_file, key_file],
+                                 stdout=recv_fp, stderr=subprocess.STDOUT, cwd=cwd)
+        time.sleep(1.0)
+        if receiver_proc.poll() is not None:
+            raise RuntimeError("Receiver exited during startup")
+        info(f"*** Starting Sender: preempt={preempt_cfg}, gop={gop_size_cfg}, "
+             f"scheduler={scheduler_cfg}, trace={video_trace} ***\n")
+        sender_proc = h1.popen([sender_bin, '10.0.1.2', '12345', video_trace,
+                               preempt_cfg, gop_size_cfg, scheduler_cfg],
+                              stdout=send_fp, stderr=subprocess.STDOUT, cwd=cwd)
+        update_thread = threading.Thread(target=dynamic_link_updater_with_jitter,
+            args=(net, prepared_trace, frame_times, stop_event,
+                  os.path.join(cwd, 'send.log'), errors, timing_state),
+            kwargs={'log_file': log_csv})
+        update_thread.start()
+        tail_proc = subprocess.Popen(['tail', '-f', os.path.join(cwd, 'send.log'),
+                                      os.path.join(cwd, 'recv.log')])
+        timeout = time.monotonic() + frame_times[-1] + 120.0
+        while sender_proc.poll() is None:
+            if errors:
+                raise RuntimeError(errors[-1])
+            if receiver_proc.poll() is not None:
+                raise RuntimeError("Receiver exited before sender completed")
+            if time.monotonic() >= timeout:
+                raise RuntimeError("Sender exceeded video duration + 120s")
+            time.sleep(0.1)
+        if sender_proc.returncode != 0:
+            raise RuntimeError(f"Sender exited with status {sender_proc.returncode}")
+        if errors:
+            raise RuntimeError(errors[-1])
+        status = 'completed'
     except KeyboardInterrupt:
-        pass
+        status = 'interrupted'
+    except Exception as exc:
+        if str(exc) not in errors:
+            errors.append(str(exc))
+        info(f"*** Experiment failed: {exc} ***\n")
     finally:
-        info("\n*** Stopping ***\n")
         stop_event.set()
-        if update_thread.is_alive():
+        if update_thread is not None:
             update_thread.join()
-        h1.cmd('killall -q video_sender || true')
-        h2.cmd('killall -q video_receiver || true')
+        # 对本次 Popen 进程发信号并 wait，接收端处理信号后释放 QUIC/转换 qlog。
+        for proc, graceful_signal in ((sender_proc, signal.SIGTERM),
+                                      (receiver_proc, signal.SIGINT),
+                                      (tail_proc, signal.SIGTERM)):
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.send_signal(graceful_signal)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    errors.append(f"Forced kill of process {proc.pid}")
+        for fp in (send_fp, recv_fp):
+            if fp is not None:
+                fp.close()
+        with open(os.path.join(cwd, 'tc_state.log'), 'w') as fp:
+            for link in links:
+                for intf in (link.intf1, link.intf2):
+                    fp.write(f"[{intf.name}]\n")
+                    fp.write(intf.node.cmd(f'tc -s qdisc show dev {shlex.quote(intf.name)}'))
+                    fp.write(intf.node.cmd(f'tc -s class show dev {shlex.quote(intf.name)}'))
         net.stop()
-        
-        info("*** Generating Plot ***\n")
-        plot_img = os.path.join(cwd, "link_metrics_plot.png")
-        plot_metrics(log_csv, plot_img)
-
-        # I帧优先机制测试：归档本次运行产物（消融对比用），
-        # 标签含抢占开关、GOP 间隔与调度策略，便于区分不同消融组合。
-        run_tag = os.environ.get("RUN_TAG", None)
-        if run_tag is None:
-            run_tag = ("cfg_" + preempt_cfg + "_gop" + gop_size_cfg
-                       + "_" + scheduler_cfg
-                       + "_" + time.strftime("%Y%m%d_%H%M%S"))
+        if errors:
+            status = 'failed'
+        elif receiver_proc is not None and receiver_proc.returncode != 0:
+            status = 'failed'
+            errors.append(f"Receiver exited with status {receiver_proc.returncode}")
+        intervals = [b - a for a, b in zip(frame_times, frame_times[1:]) if b > a]
+        timing_limit_ms = min(intervals) * 1000 if intervals else 10.0
+        manifest = {'status': status, 'errors': errors,
+                    'sender_exit': None if sender_proc is None else sender_proc.returncode,
+                    'receiver_exit': None if receiver_proc is None else receiver_proc.returncode,
+                    'preempt': preempt_cfg, 'gop_size': gop_size_cfg, 'scheduler': scheduler_cfg,
+                    'random_seed': RANDOM_SEED, 'jitter_probability': JITTER_PROBABILITY,
+                    'jitter_delays_ms': JITTER_DELAYS, 'video_trace': video_trace,
+                    'clock': 'CLOCK_MONOTONIC', 'timing': timing_state,
+                    'timing_limit_ms': timing_limit_ms,
+                    'timing_valid': status == 'completed' and not errors and timing_state['frames_skipped'] == 0
+                        and timing_state['max_update_lag_ms'] <= timing_limit_ms,
+                    'input_sha256': {}}
+        for path in (trace_file, video_trace, ground_thr_path, ground_lat_path,
+                     sky_thr_path, sky_lat_path, sender_bin, receiver_bin):
+            with open(path, 'rb') as fp:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: fp.read(1048576), b''):
+                    digest.update(chunk)
+            manifest['input_sha256'][os.path.basename(path)] = digest.hexdigest()
+        git_head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=cwd,
+                                  capture_output=True, text=True)
+        manifest['source_git_head'] = git_head.stdout.strip() if git_head.returncode == 0 else None
+        manifest['qlog_counts'] = {directory: len([name for name in os.listdir(os.path.join(cwd, directory))
+                                                    if name.endswith('.qlog')])
+                                   if os.path.isdir(os.path.join(cwd, directory)) else 0
+                                   for directory in ('qlog_sender', 'qlog_receiver')}
+        with open(os.path.join(cwd, 'send.log')) as fp:
+            send_text = fp.read()
+        with open(os.path.join(cwd, 'recv.log')) as fp:
+            recv_text = fp.read()
+        origin = re.search(r'\[VIDEO_START\] monotonic_us=(\d+)', send_text)
+        frame_generated = re.findall(r'\[FRAME_GEN\] frame=(\d+).*gen_ts=(\d+)', send_text)
+        if origin:
+            timing_state['frame_generation_lag_max_ms'] = max(
+                [max(0.0, (int(ts) - int(origin[1])) / 1000 - frame_times[int(frame)] * 1000)
+                 for frame, ts in frame_generated if int(frame) < len(frame_times)] or [0.0])
+            if timing_state['frame_generation_lag_max_ms'] > timing_limit_ms:
+                manifest['timing_valid'] = False
+        else:
+            status = manifest['status'] = 'failed'
+            manifest['timing_valid'] = False
+            errors.append('Missing VIDEO_START; sender binary/source mismatch')
+        expected = {int(sid): int(size) for sid, size in re.findall(
+            r'\[STREAM_MAP\] stream=(\d+).*stream_len=(\d+)', send_text)}
+        receipts = re.findall(r'\[FRAME_RECV\].*stream=(\d+) total_pkts=(\d+) '
+                              r'recv_pkts=(\d+) size=(\d+)', recv_text)
+        valid = {int(sid) for sid, total, count, size in receipts
+                 if expected.get(int(sid)) == int(size) and int(total) > 0 and total == count}
+        manifest['frames'] = {'generated': len(re.findall(r'\[FRAME_GEN\]', send_text)),
+                              'admitted': len(expected), 'complete': len(valid),
+                              'missing': len(set(expected) - valid),
+                              'invalid_completion_records': len(receipts) - len(valid),
+                              'incomplete_fin': len(re.findall(r'\[FRAME_INCOMPLETE\]', recv_text))}
+        if manifest['frames']['invalid_completion_records'] or manifest['frames']['incomplete_fin']:
+            status = manifest['status'] = 'failed'
+            manifest['timing_valid'] = False
+            errors.append('Receiver reported invalid/incomplete application frames')
+        if status == 'completed' and not all(manifest['qlog_counts'].values()):
+            status = manifest['status'] = 'failed'
+            manifest['timing_valid'] = False
+            errors.append('Missing sender/receiver qlog after process shutdown')
+        with open(os.path.join(cwd, 'run_manifest.json'), 'w') as fp:
+            json.dump(manifest, fp, indent=2)
+        run_tag = os.environ.get('RUN_TAG') or (
+            f"cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
+            + time.strftime('%Y%m%d_%H%M%S') + f"_{time.time_ns() % 1000000000:09d}")
         archive_run(cwd, run_tag)
+        info(f"*** Experiment {status}; timing_valid={manifest['timing_valid']} ***\n")
+    if status != 'completed':
+        raise SystemExit(1)
 
 if __name__ == '__main__':
     setLogLevel('info')

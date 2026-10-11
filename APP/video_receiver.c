@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -29,6 +30,14 @@
  */
 #define UDP_HDR_SIZE 16
 
+static volatile sig_atomic_t stop_requested = 0;
+
+static void receiver_stop(int signum)
+{
+    (void)signum;
+    stop_requested = 1;
+}
+
 typedef struct {
     /* 帧级信息 */
     uint64_t frame_idx;
@@ -36,6 +45,7 @@ typedef struct {
     int total_pkts;
     int pkts_received;
     size_t received_len;
+    int invalid;
 
     /* 流数据重组缓冲，因为 stream_data 回调可能只收到部分 app pkt */
     uint8_t* reassembly_buf;
@@ -144,9 +154,12 @@ static void receiver_parse_app_pkts(stream_ctx_t* s_ctx, uint64_t recv_ts)
         memcpy(&total_pkts, s_ctx->reassembly_buf + 12, sizeof(uint32_t));
         memcpy(&payload_size, s_ctx->reassembly_buf + 16, sizeof(uint32_t));
 
-        if (payload_size > APP_PKT_PAYLOAD_MAX || total_pkts == 0 || total_pkts > 100000) {
+        if (payload_size == 0 || payload_size > APP_PKT_PAYLOAD_MAX ||
+            total_pkts == 0 || total_pkts > 100000 || pkt_idx >= total_pkts ||
+            frame_class > APP_FRAME_CLASS_I) {
             printf("[APP_PKT_RECV] Warning: invalid app pkt header, payload_size=%u total=%u\n",
                 payload_size, total_pkts);
+            s_ctx->invalid = 1;
             break;
         }
 
@@ -158,6 +171,12 @@ static void receiver_parse_app_pkts(stream_ctx_t* s_ctx, uint64_t recv_ts)
             s_ctx->frame_idx = frame_idx;
             s_ctx->frame_class = frame_class;
             s_ctx->total_pkts = (int)total_pkts;
+        }
+        if (s_ctx->frame_idx != frame_idx || s_ctx->frame_class != frame_class ||
+            s_ctx->total_pkts != (int)total_pkts || pkt_idx != (uint32_t)s_ctx->pkts_received) {
+            s_ctx->invalid = 1;
+            printf("[APP_PKT_RECV] Warning: inconsistent frame or packet sequence\n");
+            break;
         }
         s_ctx->pkts_received++;
 
@@ -189,6 +208,7 @@ static int receiver_callback(picoquic_cnx_t* cnx,
         break;
 
     case picoquic_callback_stream_data:
+    case picoquic_callback_stream_fin:
         if (s_ctx == NULL) {
             s_ctx = (stream_ctx_t*)malloc(sizeof(stream_ctx_t));
             if (!s_ctx) return -1;
@@ -196,7 +216,7 @@ static int receiver_callback(picoquic_cnx_t* cnx,
             picoquic_set_app_stream_ctx(cnx, stream_id, s_ctx);
         }
 
-        app->current_pkt_had_stream_data = 1;
+        if (length > 0) app->current_pkt_had_stream_data = 1;
 
         /* 将收到的字节追加到重组缓冲 */
         if (length > 0) {
@@ -215,15 +235,16 @@ static int receiver_callback(picoquic_cnx_t* cnx,
 
             receiver_parse_app_pkts(s_ctx, picoquic_current_time());
         }
-        break;
-
-    case picoquic_callback_stream_fin:
-        if (s_ctx) {
+        /* FIN may deliver the last non-empty data chunk. Process it above first. */
+        if (fin_or_event == picoquic_callback_stream_fin) {
             uint64_t now = picoquic_current_time();
             /* 如果还有未解析完的数据，最后再尝试一次 */
             receiver_parse_app_pkts(s_ctx, now);
 
-            printf("[FRAME_RECV] frame=%" PRIu64 " class=%s stream=%" PRIu64 " total_pkts=%d recv_pkts=%d size=%zu recv_ts=%lu\n",
+            int complete = !s_ctx->invalid && s_ctx->total_pkts > 0 &&
+                s_ctx->pkts_received == s_ctx->total_pkts && s_ctx->reassembly_len == 0;
+            printf("[%s] frame=%" PRIu64 " class=%s stream=%" PRIu64 " total_pkts=%d recv_pkts=%d size=%zu recv_ts=%lu\n",
+                complete ? "FRAME_RECV" : "FRAME_INCOMPLETE",
                 s_ctx->frame_idx, (s_ctx->frame_class == APP_FRAME_CLASS_I) ? "I" : "BP",
                 stream_id, s_ctx->total_pkts, s_ctx->pkts_received,
                 s_ctx->received_len, now);
@@ -231,9 +252,6 @@ static int receiver_callback(picoquic_cnx_t* cnx,
             free(s_ctx->reassembly_buf);
             free(s_ctx);
             picoquic_set_app_stream_ctx(cnx, stream_id, NULL);
-        } else {
-            printf("[FRAME_RECV] frame=-1 stream=%" PRIu64 " size=0 recv_ts=%lu\n",
-                stream_id, picoquic_current_time());
         }
         break;
 
@@ -297,6 +315,8 @@ static int receiver_callback(picoquic_cnx_t* cnx,
 int main(int argc, char** argv)
 {
     setbuf(stdout, NULL);
+    signal(SIGINT, receiver_stop);
+    signal(SIGTERM, receiver_stop);
 
     if (argc < 2) {
         printf("Usage: %s <port> [cert_file] [key_file]\n", argv[0]);
@@ -358,8 +378,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    while (1) {
+    while (!stop_requested) {
         int64_t delta_t = picoquic_get_next_wake_delay(quic, current_time, 10000000);
+        if (delta_t > 250000) delta_t = 250000;
 
         struct sockaddr_storage peer_addr;
         struct sockaddr_storage local_addr;
