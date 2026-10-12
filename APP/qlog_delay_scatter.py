@@ -775,6 +775,32 @@ def main():
     recv_log = args.recv_log or os.path.join(recv_run_dir, "recv.log")
     class_map = load_class_map(send_log)
     metadata = load_frame_metadata(send_log, recv_log)
+    # Media ALPN adds a bidirectional SETTINGS/START/END stream. Only explicitly
+    # registered one-AU streams belong in video-frame/packet statistics.
+    media_mode = False
+    if os.path.isfile(send_log):
+        with open(send_log, encoding='utf-8', errors='replace') as media_log:
+            media_mode = '[MEDIA_MODE]' in media_log.read()
+    if media_mode:
+        allowed_streams = set(metadata)
+        if not allowed_streams:
+            raise SystemExit('Media run has no admitted streams; no video-delay samples')
+
+        def media_packets(packets):
+            filtered = {}
+            for key, (when, data) in packets.items():
+                streams = extract_stream_frames(data)
+                if not any(stream[0] in allowed_streams for stream in streams):
+                    continue
+                clean = dict(data)
+                clean['frames'] = [frame for frame in data.get('frames', [])
+                                   if not isinstance(frame, dict) or frame.get('frame_type') != 'stream'
+                                   or (frame.get('id') is not None and int(frame['id']) in allowed_streams)]
+                filtered[key] = (when, clean)
+            return filtered
+
+        spkt, rpkt = media_packets(spkt), media_packets(rpkt)
+        print('media streams:', len(allowed_streams), 'control/ACK-only packets excluded')
 
     raw_diffs = []
     for key, (srel, _) in spkt.items():

@@ -17,6 +17,7 @@ from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.link import TCLink
 from mininet.log import setLogLevel, info
+from media_experiment import prepare_media, archive_media, media_outputs_valid, load_network_jitter_times
 
 # sudo mn -c
 # sudo python3 demo_dubao.py
@@ -231,7 +232,7 @@ class MPQUICVideoTopo(Topo):
 
 def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_event,
                                       sender_log, errors, timing_state, granularity=0.01,
-                                      log_file=None):
+                                      log_file=None, jitter_file=None):
     """在与 Linux picoquic 相同的 CLOCK_MONOTONIC 时间轴回放预计算参数。"""
     rng = random.Random(RANDOM_SEED)
     jitter = []
@@ -251,6 +252,12 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
     previous_frame = -1
     reader = None
     try:
+        if jitter_file:
+            # Independent of live encoder frames/bitrate; preserve the old network calendar.
+            with open(jitter_file, 'w') as jitter_fp:
+                jitter_fp.write('event,time,ground_jitter_ms,sky_jitter_ms\n')
+                for event, (scheduled, extras) in enumerate(zip(frame_times, jitter)):
+                    jitter_fp.write(f'{event},{scheduled:.9f},{extras[0]},{extras[1]}\n')
         # 发送端 ready 后公布未来 200 ms 的共同起点。旧二进制缺少标记时显式失败。
         while not stop_event.is_set() and start_time is None:
             if reader is None and os.path.exists(sender_log):
@@ -363,6 +370,7 @@ def archive_run(cwd, tag):
                           ("recv.log", "recv.log"),
                           ("link_metrics.csv", "link_metrics.csv"),
                           ("tc_state.log", "tc_state.log"),
+                          ("network_jitter_events.csv", "network_jitter_events.csv"),
                           ("run_manifest.json", "run_manifest.json")):
         p = os.path.join(cwd, src)
         if os.path.isdir(p):
@@ -370,12 +378,20 @@ def archive_run(cwd, tag):
         elif os.path.exists(p):
             shutil.copy2(p, os.path.join(run_dir, dst_name))
     info(f"*** Run archived to {run_dir} ***\n")
+    return run_dir
 
 def run():
 
     # sudo mn -c
     # sudo python3 demo_with_jitter.py
     cwd = os.path.dirname(os.path.abspath(__file__))
+    video_mode = os.environ.get('VIDEO_MODE', 'synthetic')
+    if video_mode not in ('synthetic', 'gst'):
+        raise ValueError('VIDEO_MODE must be synthetic or gst')
+    media = None
+    preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
+    gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
+    scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
 
     trace_file = os.path.join(cwd, "Travel.csv")
     ground_thr_path = os.path.join(cwd, "p2p_data/summary_Throughput_ground.tsv")
@@ -385,15 +401,15 @@ def run():
 
     cert_file = os.path.join(cwd, "cert.pem")
     key_file = os.path.join(cwd, "key.pem")
-    receiver_bin = os.path.join(cwd, "video_receiver")
-    sender_bin = os.path.join(cwd, "video_sender")
+    receiver_bin = os.path.join(cwd, "video_receiver_gst" if video_mode == 'gst' else "video_receiver")
+    sender_bin = os.path.join(cwd, "video_sender_gst" if video_mode == 'gst' else "video_sender")
 
     if not os.path.exists(trace_file):
         sys.exit(f"Error: {trace_file} does not exist.")
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
         sys.exit(f"Error: Certificates not found in {cwd}")
     if not os.path.exists(receiver_bin) or not os.path.exists(sender_bin):
-        sys.exit("Error: video_sender/video_receiver not built.")
+        sys.exit(f"Error: binaries for VIDEO_MODE={video_mode} not built (make media for gst).")
 
     # 每次启动前清理上次运行残留的 qlog，避免新旧日志混在一起
     cleanup_qlog(cwd)
@@ -403,11 +419,17 @@ def run():
     ground_grid = load_grid_data(ground_thr_path, ground_lat_path)
     sky_grid = load_grid_data(sky_thr_path, sky_lat_path)
     video_trace = os.path.abspath(os.environ.get("VIDEO_TRACE", os.path.join(cwd, "4k_30f_trace_0.8.csv")))
-    frame_times = load_video_trace(video_trace)
+    if video_mode == 'gst':
+        video_trace = os.path.abspath(os.environ.get('NETWORK_JITTER_TIMING_TRACE', video_trace))
+    frame_times = load_network_jitter_times(video_trace) if video_mode == 'gst' else load_video_trace(video_trace)
     if not frame_times:
         raise ValueError("video trace must contain valid frames")
     info("*** Precomputing Travel link parameters before starting traffic ***\n")
     prepared_trace = precompute_link_trace(trace_data, ground_grid, sky_grid)
+    if video_mode == 'gst':
+        media = prepare_media(cwd, preempt_cfg, gop_size_cfg, scheduler_cfg)
+        info(f"*** Media config: {media['config']} ***\n")
+        info(f"*** Live bitrate control socket: {media['control_socket']} ***\n")
 
     topo = MPQUICVideoTopo()
     # 明确指定无控制器和自动设置MAC，避免任何干扰
@@ -512,13 +534,11 @@ def run():
     info("Testing Reverse path (h2 -> h1 via 10.0.2.0/24):\n")
     h2.cmdPrint('ping -c 2 -W 1 10.0.2.1')
 
-    preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
-    gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
-    scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
     stop_event = threading.Event()
     errors = []
     timing_state = {'frames_skipped': 0, 'max_update_lag_ms': 0.0}
     log_csv = os.path.join(cwd, "link_metrics.csv")
+    jitter_csv = os.path.join(cwd, 'network_jitter_events.csv')
     sender_proc = receiver_proc = tail_proc = update_thread = None
     send_fp = recv_fp = None
     status = 'failed'
@@ -528,6 +548,8 @@ def run():
         # 初始化失败时也不得把上一轮的更新日志归档成本轮数据。
         with open(log_csv, 'w'):
             pass
+        with open(jitter_csv, 'w'):
+            pass
         send_fp = open(os.path.join(cwd, "send.log"), 'w')
         recv_fp = open(os.path.join(cwd, "recv.log"), 'w')
         # 只在握手/视频负载开始之前替换初始队列，之后不再 del/replace。
@@ -536,36 +558,48 @@ def run():
             for intf in (link.intf1, link.intf2):
                 safe_update_tc(intf, bw, f"{max(0.1, lat):.2f}ms", initialize=True)
         info("*** Starting Receiver ***\n")
-        receiver_proc = h2.popen([receiver_bin, '12345', cert_file, key_file],
+        receiver_command = media['receiver_command'] if media else [receiver_bin, '12345', cert_file, key_file]
+        receiver_proc = h2.popen(receiver_command,
                                  stdout=recv_fp, stderr=subprocess.STDOUT, cwd=cwd)
         time.sleep(1.0)
         if receiver_proc.poll() is not None:
             raise RuntimeError("Receiver exited during startup")
         info(f"*** Starting Sender: preempt={preempt_cfg}, gop={gop_size_cfg}, "
              f"scheduler={scheduler_cfg}, trace={video_trace} ***\n")
-        sender_proc = h1.popen([sender_bin, '10.0.1.2', '12345', video_trace,
-                               preempt_cfg, gop_size_cfg, scheduler_cfg],
+        sender_command = media['sender_command'] if media else [sender_bin, '10.0.1.2', '12345', video_trace,
+                                                               preempt_cfg, gop_size_cfg, scheduler_cfg]
+        sender_proc = h1.popen(sender_command,
                               stdout=send_fp, stderr=subprocess.STDOUT, cwd=cwd)
         update_thread = threading.Thread(target=dynamic_link_updater_with_jitter,
             args=(net, prepared_trace, frame_times, stop_event,
                   os.path.join(cwd, 'send.log'), errors, timing_state),
-            kwargs={'log_file': log_csv})
+            kwargs={'log_file': log_csv, 'jitter_file': jitter_csv})
         update_thread.start()
         tail_proc = subprocess.Popen(['tail', '-f', os.path.join(cwd, 'send.log'),
                                       os.path.join(cwd, 'recv.log')])
-        timeout = time.monotonic() + frame_times[-1] + 120.0
+        media_duration = media['config']['frames'] / media['config']['fps'] if media else frame_times[-1]
+        timeout_grace = 150.0 if media else 120.0
+        timeout = time.monotonic() + media_duration + timeout_grace
         while sender_proc.poll() is None:
             if errors:
                 raise RuntimeError(errors[-1])
-            if receiver_proc.poll() is not None:
+            if receiver_proc.poll() is not None and (not media or receiver_proc.returncode != 0):
                 raise RuntimeError("Receiver exited before sender completed")
             if time.monotonic() >= timeout:
-                raise RuntimeError("Sender exceeded video duration + 120s")
+                raise RuntimeError(f"Sender exceeded video duration + {timeout_grace:.0f}s")
             time.sleep(0.1)
         if sender_proc.returncode != 0:
             raise RuntimeError(f"Sender exited with status {sender_proc.returncode}")
         if errors:
             raise RuntimeError(errors[-1])
+        if media:
+            # Both pipelines must finalize their pixels/index files before teardown.
+            receiver_proc.wait(timeout=30)
+            if receiver_proc.returncode != 0:
+                raise RuntimeError(f'Receiver exited with status {receiver_proc.returncode}')
+            media_errors = media_outputs_valid(media)
+            if media_errors:
+                raise RuntimeError('; '.join(media_errors))
         status = 'completed'
     except KeyboardInterrupt:
         status = 'interrupted'
@@ -607,7 +641,13 @@ def run():
             errors.append(f"Receiver exited with status {receiver_proc.returncode}")
         intervals = [b - a for a, b in zip(frame_times, frame_times[1:]) if b > a]
         timing_limit_ms = min(intervals) * 1000 if intervals else 10.0
+        if media:
+            timing_limit_ms = min(timing_limit_ms, 1000 / media['config']['fps'])
         manifest = {'status': status, 'errors': errors,
+                    'video_mode': video_mode,
+                    'media_config': None if not media else media['config'],
+                    'media_control_socket': None if not media else media['control_socket'],
+                    'network_jitter_timing_trace': video_trace,
                     'sender_exit': None if sender_proc is None else sender_proc.returncode,
                     'receiver_exit': None if receiver_proc is None else receiver_proc.returncode,
                     'preempt': preempt_cfg, 'gop_size': gop_size_cfg, 'scheduler': scheduler_cfg,
@@ -619,7 +659,7 @@ def run():
                         and timing_state['max_update_lag_ms'] <= timing_limit_ms,
                     'input_sha256': {}}
         for path in (trace_file, video_trace, ground_thr_path, ground_lat_path,
-                     sky_thr_path, sky_lat_path, sender_bin, receiver_bin):
+                     sky_thr_path, sky_lat_path, sender_bin, receiver_bin, jitter_csv):
             with open(path, 'rb') as fp:
                 digest = hashlib.sha256()
                 for chunk in iter(lambda: fp.read(1048576), b''):
@@ -638,10 +678,11 @@ def run():
             recv_text = fp.read()
         origin = re.search(r'\[VIDEO_START\] monotonic_us=(\d+)', send_text)
         frame_generated = re.findall(r'\[FRAME_GEN\] frame=(\d+).*gen_ts=(\d+)', send_text)
+        generation_times = media['frame_times'] if media else frame_times
         if origin:
             timing_state['frame_generation_lag_max_ms'] = max(
-                [max(0.0, (int(ts) - int(origin[1])) / 1000 - frame_times[int(frame)] * 1000)
-                 for frame, ts in frame_generated if int(frame) < len(frame_times)] or [0.0])
+                [max(0.0, (int(ts) - int(origin[1])) / 1000 - generation_times[int(frame)] * 1000)
+                 for frame, ts in frame_generated if int(frame) < len(generation_times)] or [0.0])
             if timing_state['frame_generation_lag_max_ms'] > timing_limit_ms:
                 manifest['timing_valid'] = False
         else:
@@ -659,6 +700,14 @@ def run():
                               'missing': len(set(expected) - valid),
                               'invalid_completion_records': len(receipts) - len(valid),
                               'incomplete_fin': len(re.findall(r'\[FRAME_INCOMPLETE\]', recv_text))}
+        manifest['congestion_algorithms'] = sorted(set(re.findall(r'\[CC\] algorithm=(\S+)', send_text + recv_text)))
+        manifest['gstreamer_versions'] = re.findall(r'\[GSTREAMER\] version=(.*) source=\d+', send_text + recv_text)
+        if media:
+            manifest['media_output_errors'] = media_outputs_valid(media)
+            manifest['media_output_valid'] = not manifest['media_output_errors'] and status == 'completed'
+            if manifest['media_output_errors']:
+                status = manifest['status'] = 'failed'
+                errors.extend(manifest['media_output_errors'])
         if manifest['frames']['invalid_completion_records'] or manifest['frames']['incomplete_fin']:
             status = manifest['status'] = 'failed'
             manifest['timing_valid'] = False
@@ -667,12 +716,15 @@ def run():
             status = manifest['status'] = 'failed'
             manifest['timing_valid'] = False
             errors.append('Missing sender/receiver qlog after process shutdown')
+        if media:
+            manifest['media_output_valid'] = manifest['media_output_valid'] and status == 'completed'
         with open(os.path.join(cwd, 'run_manifest.json'), 'w') as fp:
             json.dump(manifest, fp, indent=2)
         run_tag = os.environ.get('RUN_TAG') or (
-            f"cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
+            f"{'gst_' if media else ''}cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
             + time.strftime('%Y%m%d_%H%M%S') + f"_{time.time_ns() % 1000000000:09d}")
-        archive_run(cwd, run_tag)
+        archive_dir = archive_run(cwd, run_tag)
+        archive_media(media, archive_dir)
         info(f"*** Experiment {status}; timing_valid={manifest['timing_valid']} ***\n")
     if status != 'completed':
         raise SystemExit(1)

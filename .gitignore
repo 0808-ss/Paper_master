@@ -38,3 +38,11 @@ dist/
 
 # ===== sync bundles (keep local, never push) =====
 sync/*.bundle
+
+# GStreamer media builds and per-run raw/encoded artifacts
+APP/video_sender_gst
+APP/video_receiver_gst
+APP/media_protocol_test
+APP/media_work/
+APP/runs/
+APP/network_jitter_events.csv
