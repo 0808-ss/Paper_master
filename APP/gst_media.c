@@ -309,7 +309,10 @@ static void *decoder_worker(void *opaque)
         media_frame_release(&item.frame);
         if (gst_app_src_push_buffer(GST_APP_SRC(m->appsrc), b) != GST_FLOW_OK) {
             pthread_mutex_lock(&m->lock); int stopping = m->stop; pthread_mutex_unlock(&m->lock);
-            if (!stopping) fail_media(m, "decoder push failed"); break;
+            if (!stopping) {
+                fail_media(m, "decoder push failed");
+            }
+            break;
         }
     }
     return NULL;

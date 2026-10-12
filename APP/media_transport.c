@@ -235,7 +235,10 @@ static int transport_callback(picoquic_cnx_t *cnx, uint64_t sid, uint8_t *bytes,
             uint8_t *data = realloc(s->bytes, cap); if (!data) return fail_transport(t, "stream buffer allocation");
             t->rx_capacity += cap - s->cap; s->bytes = data; s->cap = cap;
         }
-        if (length) memcpy(s->bytes + s->len, bytes, length); s->len += length;
+        if (length) {
+            memcpy(s->bytes + s->len, bytes, length);
+        }
+        s->len += length;
         if (event == picoquic_callback_stream_fin) {
             media_frame_t f;
             if (media_frame_unpack(s->bytes, s->len, &f)) {
@@ -335,7 +338,7 @@ static int network_tick(transport_t *t, picoquic_quic_t *quic, uint64_t now)
             packet, sizeof(packet), 0, &now);
         if (n < 0) return fail_transport(t, "UDP receive failed");
         if (!n) break;
-        uint64_t sent = 0; uint32_t seq = 0; const uint8_t *data = packet; int length = n;
+        uint64_t sent = 0; uint32_t seq = 0; uint8_t *data = packet; int length = n;
         if (!t->sender) {
             if (n <= UDP_EXPERIMENT_HEADER) continue;
             memcpy(&sent, packet, 8); memcpy(&seq, packet + 8, 4);
