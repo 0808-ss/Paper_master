@@ -84,6 +84,51 @@ sudo python3 media_bitrate.py /tmp/mpquic_实际运行编号.sock 6000
 
 源 EOS 后控制接口关闭，不接受在已结束的视频上修改码率。
 
+## qlog 时延图修补与同步（gst-delay-scatter-fix-v1）
+
+gst 模式使用真实编码 AU；一 AU 一条单向 QUIC 流。小 AU 常由单个 QUIC 包承载，其包时延和帧传输时延坐标重合。旧图中的实心帧标记遮住了包点，不能据此认定漏计视频包。修补后使用空心帧轮廓与置顶实心包点，并保存三张图：
+
+- `qlog_frame_packet_delay_scatter.png`：帧与包合并图。
+- `qlog_packet_delay_scatter.png`：仅包点。
+- `qlog_frame_delay_scatter.png`：仅帧点。
+
+默认对数纵轴显示全部正延迟，显式 `--y-floor-ms` 才裁剪；0 或负时延保留 CSV，但无法绘在对数轴。Path 2 摘要合并 path 1/2 原始样本再算分位数。图/CSV 的帧传输延迟不含解码或播放缓冲。控制流 0 和纯 ACK 包仍排除；包中同时含视频与控制数据时，仅保留视频流归因。
+
+本地 Windows PowerShell 发布已提交修补（以下命令由用户执行）：
+
+```powershell
+Set-Location D:\Paper_master
+git push origin main
+git push origin refs/tags/rollback-before-gst-delay-scatter-fix refs/tags/gst-delay-scatter-fix-v1
+```
+
+远端只需同步外层仓库；picoquic 不变，不需要新 bundle 或重编译媒体程序：
+
+```bash
+cd /home/duwenji/ljy/Paper_master
+git pull --ff-only origin main
+git fetch origin tag gst-delay-scatter-fix-v1
+git diff --exit-code gst-delay-scatter-fix-v1 -- APP/qlog_delay_scatter.py APP/tests/test_qlog_delay_scatter.py
+cd APP
+python -m unittest discover -s tests -p 'test_qlog_delay_scatter.py'
+```
+
+重新分析当前 APP 目录中已有的这轮日志，无需重跑网络实验：
+
+```bash
+python qlog_delay_scatter.py --outdir delay_analysis_gst --outlier-rule cap:1500
+```
+
+对于已归档轮次，将 `实际归档标签` 替换为该轮目录名：
+
+```bash
+python qlog_delay_scatter.py --run-dir runs/实际归档标签 --outlier-rule cap:1500
+```
+
+此时 qlog、send.log、recv.log 与 manifest 从同一轮读取，输出写入该轮 `delay_analysis/`。每端有多份 qlog 时必须用 `--sender` / `--receiver` 明确选择同一连接的文件；不按文件名排序猜测。已知 gst 的归档缺 send.log 时明确失败。`timing_valid=false` 会打印提示，实际传输时延仍可观察，严格算法对比需另验收网络回放时序。
+
+本地遵守《项目.md》只进行源码静态检查，未执行上述测试、重新画图或网络实验。远端应确认本轮仍为 156 个视频包、150 个完整帧、5 个 I 帧，合并图可见实心包点和空心帧轮廓，包独立图包含包散点，终端仅有一行 Path 2 摘要。默认设置不应再出现 p5 裁掉 14 个低延迟样本的提示。
+
 ## 归档与画质报告
 
 每轮归档位置为 `APP/runs/<标签>/`。除了原 qlog、send.log、recv.log、link_metrics.csv、TC 状态和 manifest，新增：

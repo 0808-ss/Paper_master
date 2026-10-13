@@ -36,11 +36,11 @@ qlog_delay_scatter.py — 依据 qlog 直接生成帧延迟 / 包延迟散点图
   命令行等价参数：--outlier-rule cap:150 | pct:99 | path:0:50,1:100 | none
   详见各函数 docstring。
 
-输出（单图）：
+输出（三张图及 CSV）：
   qlog_frame_packet_delay_scatter.png    帧延迟 + 包延迟合并散点（单图）
-                                         - 包=小圆点；帧=方块；I 帧=菱形（黑色描边）
-                                         - 纵轴为对数刻度，下界默认自适应（取正延迟 p5
-                                           分位，保证最多丢弃 5% 的数据点）
+                                         - 包=实心小圆点；帧=空心方块；I 帧=空心菱形
+                                         - 帧标记空心，包点置顶，单包 AU 重合时两者仍可见
+                                         - 纵轴为对数刻度，下界默认覆盖全部正延迟
                                          - 极端离群值不拉伸纵轴，改在纵轴顶部用 × 标注
                                            （保留真实发送时刻与路径颜色；离群判定规则
                                            由 --outlier-rule / make_outlier_rule 指定）
@@ -51,6 +51,8 @@ qlog_delay_scatter.py — 依据 qlog 直接生成帧延迟 / 包延迟散点图
                                          --path-labels 0:0,1:1,2:2 可回到原始编号列）
   qlog_packet_delay.csv                 包级明细（path_id 为 qlog 原始路径号，
                                          另附 path_label 展示标签列）
+  qlog_packet_delay_scatter.png         独立包延迟图（避免与帧重合）
+  qlog_frame_delay_scatter.png          独立帧延迟图
 
 用法：
   python qlog_delay_scatter.py [--sender 发送端.qlog]
@@ -67,6 +69,7 @@ qlog_delay_scatter.py — 依据 qlog 直接生成帧延迟 / 包延迟散点图
   qlog_sender/*.qlog 与 qlog_receiver/*.qlog。
 
   python qlog_delay_scatter.py --outlier-rule cap:150
+  python qlog_delay_scatter.py --run-dir runs/<RUN_TAG> --outlier-rule cap:1500
 
 """
 
@@ -399,6 +402,26 @@ def find_qlog(base_dir, subdir):
     return sorted(glob.glob(os.path.join(d, "*.qlog")))
 
 
+def select_qlog(explicit, run_dir, subdir):
+    """一个实验只选一个连接，避免用文件名排序误配多次连接。"""
+    if explicit:
+        return os.path.abspath(explicit)
+    candidates = find_qlog(run_dir, subdir)
+    if len(candidates) != 1:
+        raise ValueError('%s 中需要恰好一份 qlog（找到 %d）；请显式指定 --sender/--receiver'
+                         % (os.path.join(run_dir, subdir), len(candidates)))
+    return candidates[0]
+
+
+def packet_delay_summary(packets, paths, labels):
+    """按展示标签汇总原始样本后计算分位数，不能平均各路径分位数。"""
+    grouped = defaultdict(list)
+    for pk in packets:
+        if pk['path_id'] in paths and pk['delay_us'] is not None:
+            grouped[label_of(pk['path_id'], labels)].append(pk['delay_us'])
+    return {lab: sorted(grouped[lab]) for lab in ordered_labels(labels) if grouped[lab]}
+
+
 def load_qlog(path):
     """读取 qlog 文件，返回 (reference_time, events)。"""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -407,8 +430,44 @@ def load_qlog(path):
     if not traces:
         raise ValueError("qlog 无 traces: %s" % path)
     tr = traces[0]
+    if len(traces) != 1:
+        raise ValueError("请选择单连接 qlog，不能混合多个 traces: %s" % path)
+    units = (tr.get('configuration') or {}).get('time_units', 'us')
+    if units != 'us':
+        raise ValueError("本脚本要求 picoquic 微秒 qlog (time_units=us): %s" % path)
     ref = int((tr.get("common_fields") or {}).get("reference_time", 0) or 0)
-    return ref, tr.get("events") or []
+    events = normalize_events(tr.get('events') or [], tr.get('event_fields'))
+    return ref, events
+
+
+def normalize_events(events, event_fields=None):
+    """按 event_fields 转为五列；无路径的四列日志属于包号空间 0。"""
+    if event_fields is not None:
+        required = {'relative_time', 'category', 'event', 'data'}
+        if not required.issubset(event_fields) or len(set(event_fields)) != len(event_fields):
+            raise ValueError('Unsupported qlog event_fields: %r' % event_fields)
+    normalized = []
+    path_missing = False
+    for ev in events:
+        if not isinstance(ev, list):
+            continue
+        fields = event_fields
+        if fields is None:
+            if len(ev) == 4:
+                fields = ['relative_time', 'category', 'event', 'data']
+            elif len(ev) == 5:
+                fields = ['relative_time', 'path_id', 'category', 'event', 'data']
+            else:
+                continue
+        if len(ev) != len(fields):
+            raise ValueError('qlog event length does not match event_fields: %r' % ev)
+        row = dict(zip(fields, ev))
+        path_missing |= 'path_id' not in row
+        normalized.append([row['relative_time'], row.get('path_id', 0),
+                           row['category'], row['event'], row['data']])
+    if path_missing:
+        print('note: qlog has no path_id; packet-number space is 0; physical path distribution unavailable')
+    return normalized
 
 
 def load_class_map(send_log):
@@ -439,9 +498,7 @@ def parse_1rtt_packets(events, want_event):
     返回 dict {(path_id, packet_number): (rel_time, data)}
     """
     out = {}
-    for ev in events:
-        if not isinstance(ev, list) or len(ev) < 5:
-            continue
+    for ev in normalize_events(events):
         path_id, category, event, data = ev[1], ev[2], ev[3], ev[4]
         if category != "transport" or event != want_event:
             continue
@@ -452,8 +509,26 @@ def parse_1rtt_packets(events, want_event):
         pn = (data.get("header") or {}).get("packet_number")
         if pn is None:
             continue
-        out[(int(path_id), int(pn))] = (int(ev[0]), data)
+        key = (int(path_id), int(pn))
+        # Duplicate receive records must not move first receipt/completion later.
+        if key not in out or int(ev[0]) < out[key][0]:
+            out[key] = (int(ev[0]), data)
     return out
+
+
+def filter_media_packets(packets, allowed_streams):
+    """排除控制/纯 ACK 包；混合包仅保留注册 AU 的 STREAM 归因。"""
+    filtered = {}
+    for key, (when, data) in packets.items():
+        if not any(sid in allowed_streams for sid, *_ in extract_stream_frames(data)):
+            continue
+        clean = dict(data)
+        clean['frames'] = [frame for frame in data.get('frames') or []
+                           if isinstance(frame, dict) and
+                           (frame.get('frame_type') != 'stream' or
+                            (frame.get('id') is not None and int(frame['id']) in allowed_streams))]
+        filtered[key] = (when, clean)
+    return filtered
 
 
 def extract_stream_frames(data):
@@ -561,10 +636,10 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
     """
     单图：帧延迟 + 包延迟合并散点。
       - x=发送时刻(s)，y=延迟(ms)，纵轴为对数刻度（log10）
-      - 包=小圆点（底层）；帧=方块（上层，黑色细边）；I 帧=菱形（黑色粗边）
+      - 包=置顶实心小圆点；帧=空心方块；I 帧=空心菱形粗边
       - 路径标记默认 path0->"Path 1"（蓝）、path1+path2->"Path 2"（红），
         可用 path_labels（dict 或 "0:1,1:2,2:2" 字符串）动态调整
-      - 纵轴下界：y_floor_ms<=0 时自动取全部正延迟的 p5 分位作下界
+      - 纵轴下界：y_floor_ms<=0 时覆盖全部正延迟；显式 >0 才裁剪
       - 离群（×）判定：outlier_rule（make_outlier_rule() 返回值 / 字符串 / None）；
         兼容旧参数 y_cap_ms（outlier_rule 为 None 时生效）
       - 图例显示在主图右侧（bbox_to_anchor 移到坐标轴外），与数据区分离
@@ -596,14 +671,14 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
     top = cap * 1.6 if (have_outliers and cap is not None) else max(all_y) * 2.0
     outlier_y = top * 0.88
 
-    # ---- 底层：正常包（小圆点，半透明；按展示标签着色）----
+    # Packet points remain visible inside hollow frame markers for one-packet AUs.
     for p in sorted({pk["path_id"] for pk in norm_p}):
         sel = [pk for pk in norm_p if pk["path_id"] == p]
         ax.scatter([pk["send_rel"] / 1e6 for pk in sel],
                    [pk["delay_us"] / 1e3 for pk in sel],
-                   s=11, alpha=0.5, marker=PKT_MARKER,
+                   s=18, alpha=0.8, marker=PKT_MARKER,
                    color=label_color(label_of(p, labels), ordered),
-                   linewidths=0)
+                   linewidths=0, zorder=6)
     # ---- 离群包 → ×（保留真实发送时刻与路径颜色）----
     for pk in out_p:
         ax.scatter(pk["send_rel"] / 1e6, outlier_y,
@@ -611,18 +686,20 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
                    color=label_color(label_of(pk["path_id"], labels), ordered),
                    linewidths=1.7, zorder=6)
 
-    # ---- 上层：正常帧（方块；I 帧=菱形黑色描边）----
+    # ---- 帧空心轮廓（方块；I 帧=菱形），不移动真实坐标 ----
     for fr in norm_f:
         x = fr["send_first_us"] / 1e6
         y = fr["frame_delay_us"] / 1e3
         color = label_color(label_of(fr["main_path"], labels), ordered)
         if fr["is_iframe"]:
-            ax.scatter(x, y, s=60, alpha=0.95, marker=IFRAME_MARKER,
-                       color=color, edgecolors="#111111", linewidths=1.1, zorder=5)
+            ax.scatter(x, y, s=110, alpha=0.95, marker=IFRAME_MARKER,
+                       facecolors='none', edgecolors=color, linewidths=1.8, zorder=5)
         else:
-            ax.scatter(x, y, s=34, alpha=0.9, marker=FRAME_MARKER,
-                       color=color, edgecolors="#111111", linewidths=0.4, zorder=4)
+            ax.scatter(x, y, s=72, alpha=0.95, marker=FRAME_MARKER,
+                       facecolors='none', edgecolors=color, linewidths=1.2, zorder=4)
     # ---- 离群帧 → × ----
+    # Outlier packet/frame coordinates also overlap in the compressed band;
+    # separate exports below retain visibility of each series.
     for fr in out_f:
         ax.scatter(fr["send_first_us"] / 1e6, outlier_y, s=95,
                    marker="x",
@@ -640,19 +717,24 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
 
     handles, labels_ = [], []
     for lab, color in legend_groups:
+        if not packets:
+            continue
         handles.append(Line2D([0], [0], marker=PKT_MARKER, linestyle="none",
                               markersize=7, markerfacecolor=color,
                               markeredgecolor="none",
                               label="Packet \u00b7 %s" % lab))
     for lab, color in legend_groups:
+        if not frames:
+            continue
         handles.append(Line2D([0], [0], marker=FRAME_MARKER, linestyle="none",
-                              markersize=7, markerfacecolor=color,
-                              markeredgecolor="#111111", markeredgewidth=0.6,
+                              markersize=9, markerfacecolor='none',
+                              markeredgecolor=color, markeredgewidth=1.2,
                               label="Frame \u00b7 %s" % lab))
-    handles.append(Line2D([0], [0], marker=IFRAME_MARKER, linestyle="none",
-                          markersize=8, markerfacecolor="#888888",
-                          markeredgecolor="#111111", markeredgewidth=1.2,
-                          label="I-frame"))
+    if frames:
+        handles.append(Line2D([0], [0], marker=IFRAME_MARKER, linestyle="none",
+                              markersize=10, markerfacecolor='none',
+                              markeredgecolor="#333333", markeredgewidth=1.8,
+                              label="I-frame"))
     if have_outliers:
         handles.append(Line2D([0], [0], marker="x", linestyle="none",
                               markersize=9, markeredgecolor="#333333",
@@ -662,15 +744,16 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
 
     ax.set_xlabel("Send time (s)")
     ax.set_ylabel("Delay (ms)")
-    ax.set_title("Frame & Packet Delay Scatter (qlog, by path)")
+    kind = 'Frame & Packet' if packets and frames else 'Packet' if packets else 'Frame'
+    ax.set_title("%s Delay Scatter (qlog, by path)" % kind)
 
     # ---- 纵坐标改为对数刻度（避免离群值把主体压缩到看不清）----
     ax.set_yscale("log")
-    # 主刻度：十进制定位 + 普通十进制标签（10 / 1 / 0.1 ...）
-    ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0))
+    # 主刻度：每十进制区间的 1/2/3/5 倍，使用普通十进制标签。
+    ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1, 2, 3, 5)))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_ms))
-    # 次刻度（2、3、5 倍）只画网格不标数字
-    ax.yaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=(2, 3, 5),
+    # 在 10～30ms 等窄范围也能显示数值刻度。
+    ax.yaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=(4, 6, 7, 8, 9),
                                                   numticks=20))
     ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.grid(True, which="major", axis="y", alpha=0.4,
@@ -679,15 +762,14 @@ def plot_combined(packets, frames, paths, out_path, y_floor_ms=0.0,
             linestyle=":", linewidth=0.5)
 
     # ---- 纵轴范围 ----
-    # 下界：y_floor_ms<=0 时自适应取正延迟 p5（保证最多丢弃 5% 的点）；
+    # 下界：y_floor_ms<=0 时覆盖全部正延迟；
     #      >0 时作为固定下界（丢弃比例由用户负责）
     if y_floor_ms and y_floor_ms > 0:
         lo = max(min(all_y) / 2.0, y_floor_ms)
         floor_desc = "fixed %.4g ms" % lo
     else:
-        sy_all = sorted(all_y)
-        lo = sy_all[min(int(len(sy_all) * 0.05), len(sy_all) - 1)]
-        floor_desc = "auto p5 %.4g ms" % lo
+        lo = min(min(all_y) * 0.9, top / 2.0)
+        floor_desc = "auto min %.4g ms" % lo
     ax.set_ylim(lo, top)
     n_clip = sum(1 for v in all_y if v < lo)
     if n_clip:
@@ -715,7 +797,8 @@ def main():
     parser = argparse.ArgumentParser(description="依据 qlog 生成帧延迟/包延迟散点图")
     parser.add_argument("--sender", default=None, help="发送端 qlog 路径")
     parser.add_argument("--receiver", default=None, help="接收端 qlog 路径")
-    parser.add_argument("--outdir", default=None, help="输出目录（默认：脚本所在目录）")
+    parser.add_argument("--run-dir", default=None, help="本轮实验目录，如 runs/<RUN_TAG>；自动读取 qlog/send.log/recv.log")
+    parser.add_argument("--outdir", default=None, help="输出目录（--run-dir 时默认本轮 delay_analysis，否则脚本目录）")
     parser.add_argument("--min-owd-us", type=int, default=0,
                         help="链路最小单向延迟(us)，用于时钟对齐校正，默认 0")
     parser.add_argument("--clock-mode", choices=('same-clock', 'min-owd'), default='same-clock',
@@ -728,10 +811,9 @@ def main():
                         help="包数超过该值的帧判定为 I 帧（仅在 send.log 无显式帧类标记时作为回退），默认 30")
     parser.add_argument("--class-map", default=None,
                         help="send.log 路径，用于读取发送端显式帧类标记（stream->I/BP）；"
-                             "缺省时自动在脚本目录查找 send.log")
+                             "缺省时在发送端 qlog 所属实验目录查找 send.log")
     parser.add_argument("--y-floor-ms", type=float, default=0.0,
-                        help="对数纵轴下界(ms)；0=自动取正延迟 p5 分位"
-                             "（保证最多丢弃 5%% 的点），默认 0")
+                        help="对数纵轴下界(ms)；0=覆盖全部正延迟；>0 显式裁剪，默认 0")
     parser.add_argument("--y-cap-ms", type=float, default=100.0,
                         help="[兼容旧参数] 极端离群分界(ms)，超过该值的点用 × 标注；"
                              "等价 --outlier-rule cap:<值>，默认 100")
@@ -747,12 +829,12 @@ def main():
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    sender_list = find_qlog(base_dir, "qlog_sender")
-    recv_list = find_qlog(base_dir, "qlog_receiver")
-    sender_path = args.sender or (sender_list[-1] if sender_list else None)
-    receiver_path = args.receiver or (recv_list[-1] if recv_list else None)
-    if not sender_path or not receiver_path:
-        raise SystemExit("找不到 qlog；请用 --sender/--receiver 指定路径。")
+    input_dir = os.path.abspath(args.run_dir) if args.run_dir else base_dir
+    try:
+        sender_path = select_qlog(args.sender, input_dir, 'qlog_sender')
+        receiver_path = select_qlog(args.receiver, input_dir, 'qlog_receiver')
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     print("sender   qlog:", sender_path)
     print("receiver qlog:", receiver_path)
 
@@ -771,6 +853,10 @@ def main():
     receiver_dir = os.path.dirname(os.path.abspath(receiver_path))
     run_dir = os.path.dirname(sender_dir) if os.path.basename(sender_dir) == 'qlog_sender' else sender_dir
     recv_run_dir = os.path.dirname(receiver_dir) if os.path.basename(receiver_dir) == 'qlog_receiver' else receiver_dir
+    if run_dir != recv_run_dir:
+        raise SystemExit('Sender/receiver qlogs must belong to the same run directory')
+    if args.run_dir and run_dir != input_dir:
+        raise SystemExit('--run-dir does not match the explicitly supplied qlogs')
     send_log = args.class_map or os.path.join(run_dir, "send.log")
     recv_log = args.recv_log or os.path.join(recv_run_dir, "recv.log")
     class_map = load_class_map(send_log)
@@ -778,28 +864,25 @@ def main():
     # Media ALPN adds a bidirectional SETTINGS/START/END stream. Only explicitly
     # registered one-AU streams belong in video-frame/packet statistics.
     media_mode = False
+    manifest_path = os.path.join(run_dir, 'run_manifest.json')
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding='utf-8') as fp:
+            manifest = json.load(fp)
+        media_mode = manifest.get('video_mode') == 'gst'
+        if manifest.get('timing_valid') is False:
+            print('note: timing_valid=false; delays describe the actual run; network replay timing failed validation')
     if os.path.isfile(send_log):
         with open(send_log, encoding='utf-8', errors='replace') as media_log:
-            media_mode = '[MEDIA_MODE]' in media_log.read()
+            media_mode |= '[MEDIA_MODE]' in media_log.read()
     if media_mode:
+        if not os.path.isfile(send_log):
+            raise SystemExit('Media run requires its send.log to identify AU streams and exclude control stream 0')
         allowed_streams = set(metadata)
         if not allowed_streams:
             raise SystemExit('Media run has no admitted streams; no video-delay samples')
 
-        def media_packets(packets):
-            filtered = {}
-            for key, (when, data) in packets.items():
-                streams = extract_stream_frames(data)
-                if not any(stream[0] in allowed_streams for stream in streams):
-                    continue
-                clean = dict(data)
-                clean['frames'] = [frame for frame in data.get('frames', [])
-                                   if not isinstance(frame, dict) or frame.get('frame_type') != 'stream'
-                                   or (frame.get('id') is not None and int(frame['id']) in allowed_streams)]
-                filtered[key] = (when, clean)
-            return filtered
-
-        spkt, rpkt = media_packets(spkt), media_packets(rpkt)
+        spkt = filter_media_packets(spkt, allowed_streams)
+        rpkt = filter_media_packets(rpkt, allowed_streams)
         print('media streams:', len(allowed_streams), 'control/ACK-only packets excluded')
 
     raw_diffs = []
@@ -907,7 +990,7 @@ def main():
     print("outlier rule:", rule_desc(rule))
 
     # ---- 输出 CSV ----
-    outdir = args.outdir or base_dir
+    outdir = args.outdir or (os.path.join(input_dir, 'delay_analysis') if args.run_dir else base_dir)
     if not os.path.isdir(outdir):
         os.makedirs(outdir)
     status_csv = os.path.join(outdir, 'qlog_frame_status.csv')
@@ -964,15 +1047,23 @@ def main():
                   y_floor_ms=args.y_floor_ms,
                   outlier_rule=rule, path_labels=labels)
     print("wrote:", fig_path)
+    for name, selected_packets, selected_frames in (
+            ('qlog_packet_delay_scatter.png', packets, []),
+            ('qlog_frame_delay_scatter.png', [], frames)):
+        path = os.path.join(outdir, name)
+        plot_combined(selected_packets, selected_frames, paths, path,
+                      y_floor_ms=args.y_floor_ms,
+                      outlier_rule=rule.copy(), path_labels=labels)
+        print('wrote:', path)
+    print('plot samples: packets=%d frames=%d; hollow frame markers preserve coincident packet points'
+          % (len(packets), len(frames)))
 
     # ---- 延迟统计摘要（按展示标签输出）----
-    for p in paths:
-        vals = sorted(pk["delay_us"] for pk in packets
-                      if pk["path_id"] == p and pk["delay_us"] is not None)
+    for label, vals in packet_delay_summary(packets, paths, labels).items():
         if vals:
             n = len(vals)
-            print("%s packet delay(ms): min=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f" % (
-                label_of(p, labels), vals[0] / 1e3, vals[n // 2] / 1e3,
+            print("%s packet delay(ms): n=%d min=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f" % (
+                label, n, vals[0] / 1e3, vals[n // 2] / 1e3,
                 vals[int(n * 0.95)] / 1e3, vals[int(n * 0.99)] / 1e3, vals[-1] / 1e3))
     fvals = sorted(f["frame_delay_us"] for f in frames)
     if fvals:
