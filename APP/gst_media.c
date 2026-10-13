@@ -330,7 +330,7 @@ static gst_media_t *open_common(const media_config_t *cfg, int source)
     if (m->wake < 0) goto bad;
     gchar *pipeline = NULL;
     if (source) {
-        if (!cfg->pattern || (strcmp(cfg->pattern, "ball") && strcmp(cfg->pattern, "zone-plate") && strcmp(cfg->pattern, "smpte"))) goto bad;
+        if (!cfg->pattern || (strcmp(cfg->pattern, "ball") && strcmp(cfg->pattern, "zone-plate") && strcmp(cfg->pattern, "smpte") && strcmp(cfg->pattern, "snow"))) goto bad;
         pipeline = g_strdup_printf(
             "videotestsrc name=source is-live=true pattern=%s %s num-buffers=%u ! "
             "video/x-raw,format=I420,width=%u,height=%u,framerate=%u/1,colorimetry=bt709 ! tee name=raw "
@@ -342,7 +342,8 @@ static gst_media_t *open_common(const media_config_t *cfg, int source)
             "raw. ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 ! "
             "appsink name=reference sync=false max-buffers=8 drop=false",
             cfg->pattern, !strcmp(cfg->pattern, "zone-plate") ? "kx2=20 ky2=20 kt=1" :
-                (!strcmp(cfg->pattern, "ball") ? "animation-mode=frames" : "horizontal-speed=8"),
+                (!strcmp(cfg->pattern, "ball") ? "animation-mode=frames" :
+                 (!strcmp(cfg->pattern, "smpte") ? "horizontal-speed=8" : "")),
             cfg->frames, cfg->width, cfg->height, cfg->fps, cfg->bitrate_kbps, cfg->gop);
     } else {
         pipeline = g_strdup("appsrc name=input is-live=true format=time do-timestamp=false block=true max-bytes=4194304 "
@@ -391,7 +392,10 @@ static gst_media_t *open_common(const media_config_t *cfg, int source)
         GstAppSinkCallbacks cb = {0}; cb.new_sample = decoded_sample;
         gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cb, m, NULL); gst_object_unref(sink);
     }
-    if (gst_element_set_state(m->pipeline, GST_STATE_READY) == GST_STATE_CHANGE_FAILURE) goto bad;
+    /* Prepare live-source tasks before the common origin. Live sources produce
+       no buffers in PAUSED (NO_PREROLL); do not wait for sink preroll here.
+       First-buffer rendering/encoding cost is still measured against t0. */
+    if (gst_element_set_state(m->pipeline, source ? GST_STATE_PAUSED : GST_STATE_READY) == GST_STATE_CHANGE_FAILURE) goto bad;
     gchar *version = gst_version_string();
     printf("[GSTREAMER] version=%s source=%d\n", version, source); g_free(version);
     return m;

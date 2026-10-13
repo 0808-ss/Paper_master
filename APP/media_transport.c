@@ -144,6 +144,7 @@ static int control_record(transport_t *t, const media_control_record_t *r)
         t->t0 = now + advance;
         media_control_record_t start = {0}; start.type = MEDIA_START; start.time_us = t->t0;
         printf("[VIDEO_START] monotonic_us=%" PRIu64 "\n", t->t0);
+        fflush(stdout); /* Link replay must observe the future origin immediately. */
         return send_control(t, &start);
     }
     if (!t->sender && r->type == MEDIA_START && t->settings_seen && !t->t0) {
@@ -360,6 +361,7 @@ static int network_tick(transport_t *t, picoquic_quic_t *quic, uint64_t now)
         if (t->disconnected) return 0;
     }
     for (int batch = 0; batch < 64; ++batch) {
+        now = picoquic_current_time(); /* Never reuse the receive-loop time for a send batch. */
         size_t n = 0; picoquic_connection_id_t cid; picoquic_cnx_t *last = NULL;
         size_t prefix = t->sender ? UDP_EXPERIMENT_HEADER : 0;
         int ret = picoquic_prepare_next_packet(quic, now, packet + prefix, sizeof(packet) - prefix,
@@ -367,15 +369,23 @@ static int network_tick(transport_t *t, picoquic_quic_t *quic, uint64_t now)
         if (t->disconnected) return 0;
         if (ret) return fail_transport(t, "QUIC packet preparation failed");
         if (!n) break;
+        uint32_t seq = t->packet_seq, zero = 0;
+        uint64_t sent_us = picoquic_current_time();
         if (prefix) {
-            uint32_t seq = t->packet_seq++, zero = 0;
-            memcpy(packet, &now, 8); memcpy(packet + 8, &seq, 4); memcpy(packet + 12, &zero, 4);
-            printf("[PKT_SEND] seq=%u stream=UNKNOWN frame=-1 path=%d send_ts=%" PRIu64 " size=%zu useful=UNKNOWN\n", seq, index, now, n);
+            ++t->packet_seq;
+            memcpy(packet, &sent_us, 8); memcpy(packet + 8, &seq, 4); memcpy(packet + 12, &zero, 4);
         }
         int sock_error = 0;
         if (picoquic_send_through_server_sockets(&t->sockets, (struct sockaddr *)&peer, (struct sockaddr *)&local,
             index, (const char *)packet, (int)(n + prefix), &sock_error) != (int)(n + prefix))
             return fail_transport(t, "UDP send failed");
+        if (prefix) {
+            char a[128], b[128];
+            const char *local_text = picoquic_addr_text((struct sockaddr *)&local, a, sizeof(a));
+            const char *peer_text = picoquic_addr_text((struct sockaddr *)&peer, b, sizeof(b));
+            printf("[PKT_SEND] seq=%u stream=UNKNOWN frame=-1 path=%d send_ts=%" PRIu64 " size=%zu useful=UNKNOWN local=%s peer=%s if_index=%d\n",
+                seq, index, sent_us, n, local_text, peer_text, index);
+        }
     }
     return 0;
 }
@@ -413,7 +423,7 @@ static int options(int argc, char **argv, int first, transport_t *t)
         }
     }
     return !media_config_valid(&t->cfg) ||
-        (strcmp(t->cfg.pattern, "ball") && strcmp(t->cfg.pattern, "zone-plate") && strcmp(t->cfg.pattern, "smpte")) ||
+        (strcmp(t->cfg.pattern, "ball") && strcmp(t->cfg.pattern, "zone-plate") && strcmp(t->cfg.pattern, "smpte") && strcmp(t->cfg.pattern, "snow")) ||
         (strcmp(t->cfg.scheduler, "default") && strcmp(t->cfg.scheduler, "rr") && strcmp(t->cfg.scheduler, "minrtt")) ? -1 : 0;
 }
 static int save_config(const media_config_t *c)
@@ -430,12 +440,15 @@ static int save_config(const media_config_t *c)
 
 int media_transport_main(int argc, char **argv, int sender)
 {
-    setbuf(stdout, NULL); signal(SIGINT, stop_handler); signal(SIGTERM, stop_handler);
+    static char log_buffer[65536];
+    if (setvbuf(stdout, log_buffer, _IOFBF, sizeof(log_buffer))) return 1;
+    signal(SIGINT, stop_handler); signal(SIGTERM, stop_handler);
+    uint64_t last_log_flush = 0;
     transport_t t = {0}; t.sender = sender;
     t.cfg = (media_config_t){1920, 1080, 30, 300, 4000, 30, 200, 20, 1, 0, 0,
         "ball", "default", sender ? "media_sender" : "media_receiver", "/tmp/picoquic-video.sock"};
     if (argc < (sender ? 3 : 4) || options(argc, argv, sender ? 3 : 4, &t)) {
-        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --all-bp 0|1 --scheduler default|rr|minrtt --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte --output DIR --control-socket PATH]\n" :
+        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --all-bp 0|1 --scheduler default|rr|minrtt --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte|snow --output DIR --control-socket PATH]\n" :
             "Usage: %s <port> <cert.pem> <key.pem> [--output DIR --preview 0|1]\n", argv[0]); return 1;
     }
     uint32_t port; if (numeric(argv[sender ? 2 : 1], &port) || port < 1 || port > 65535) return 1;
@@ -487,7 +500,11 @@ int media_transport_main(int argc, char **argv, int sender)
         if (now > t.timeout_us || (t.closing && now > t.close_us + 10000000)) { fail_transport(&t, "session/close timeout"); break; }
         probe_paths(&t, now);
         if (sender && t.t0 && !t.source_started && now >= t.t0) {
+            uint64_t begin = picoquic_current_time();
             if (!t.start_acked || gst_media_start(t.media)) { fail_transport(&t, "media source start/ACK failed"); break; }
+            now = picoquic_current_time();
+            printf("[SOURCE_START] target_us=%" PRIu64 " begin_us=%" PRIu64 " returned_us=%" PRIu64 " state_change_us=%" PRIu64 "\n",
+                t.t0, begin, now, now - begin);
             t.source_started = 1;
         }
         if (sender && t.source_started && !t.source_finished && send_one_frame(&t, now)) break;
@@ -517,9 +534,15 @@ int media_transport_main(int argc, char **argv, int sender)
             printf("[DRAIN] QUIC send queue drained; peer playout completed\n");
             picoquic_close(t.cnx, 0); t.closing = 1; t.close_us = now;
         }
-        if (network_tick(&t, quic, now)) break;
+        if (network_tick(&t, quic, picoquic_current_time())) break;
         if (!t.disconnected && t.cnx && picoquic_get_cnx_state(t.cnx) == picoquic_state_disconnected) t.disconnected = 1;
-        int64_t delay = picoquic_get_next_wake_delay(quic, picoquic_current_time(), 10000);
+        now = picoquic_current_time();
+        if (now - last_log_flush >= 100000) {
+            if (fflush(stdout)) { fail_transport(&t, "log write failed"); break; }
+            last_log_flush = now;
+        }
+        now = picoquic_current_time();
+        int64_t delay = picoquic_get_next_wake_delay(quic, now, 10000);
         if (!sender && t.playout && delay > 2000) delay = 2000;
         if (sender && t.t0 && !t.source_started && now < t.t0 && (uint64_t)delay > t.t0 - now) delay = (int64_t)(t.t0 - now);
         if (wait_io(&t, delay)) { fail_transport(&t, "socket/media wait failed"); break; }
@@ -533,5 +556,6 @@ cleanup:
     if (sockets_open) picoquic_close_server_sockets(&t.sockets);
     if (quic) picoquic_free(quic);
     printf("[MEDIA_EXIT] sender=%d status=%s received=%" PRIu64 "\n", sender, t.failed ? "failed" : "completed", t.received_frames);
+    if (fflush(stdout)) t.failed = 1;
     return t.failed ? 1 : 0;
 }

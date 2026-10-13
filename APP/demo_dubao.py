@@ -18,6 +18,7 @@ from mininet.net import Mininet
 from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 from media_experiment import prepare_media, archive_media, media_outputs_valid, load_network_jitter_times
+from link_replay import TCUpdater
 
 # sudo mn -c
 # sudo python3 demo_dubao.py
@@ -251,6 +252,7 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
     start_time = None
     previous_frame = -1
     reader = None
+    updater = TCUpdater(links)
     try:
         if jitter_file:
             # Independent of live encoder frames/bitrate; preserve the old network calendar.
@@ -277,12 +279,11 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
         if stop_event.wait(max(0.0, start_time - time.monotonic())):
             return
         info(f"*** Link/video common origin: {start_time:.6f}s (monotonic) ***\n")
-        tick = 0
+        scheduled = 0.0
         with open(log_file, 'w') as log_fp:
             log_fp.write("time,ground_bw,ground_lat,ground_jitter,sky_bw,sky_lat,sky_jitter,"
-                         "applied_time,update_lag_ms,frames_skipped\n")
+                         "applied_time,update_lag_ms,frames_skipped,scheduled_time,tc_apply_ms,tc_commands,tc_batches\n")
             while not stop_event.is_set():
-                scheduled = tick * granularity
                 elapsed = time.monotonic() - start_time
                 # 保留旧 Travel 查询的 ceiling 采样规则，不改变数据集建模。
                 ti = min(bisect.bisect_left(trace_times, elapsed), len(prepared_trace) - 1)
@@ -294,26 +295,33 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
                 timing_state['frames_skipped'] += skipped
                 values = [(pt['ground_bw'], max(0.1, pt['ground_lat'] + g_extra)),
                           (pt['sky_bw'], max(0.1, pt['sky_lat'] + s_extra))]
-                for i, (bw, lat) in enumerate(values):
-                    if abs(bw - previous[i][0]) > 0.1 or abs(lat - previous[i][1]) > 0.1:
-                        for intf in (links[i].intf1, links[i].intf2):
-                            safe_update_tc(intf, bw, f"{lat:.2f}ms")
-                        previous[i] = (bw, lat)
+                apply_begin = time.monotonic()
+                previous, command_count, batch_count = updater.apply(previous, values)
                 applied = time.monotonic() - start_time
+                tc_apply_ms = (time.monotonic() - apply_begin) * 1000.0
+                timing_state['max_tc_apply_ms'] = max(timing_state.get('max_tc_apply_ms', 0.0), tc_apply_ms)
+                timing_state['tc_commands'] = timing_state.get('tc_commands', 0) + command_count
+                timing_state['tc_batches'] = timing_state.get('tc_batches', 0) + batch_count
                 lag_ms = max(0.0, applied - scheduled) * 1000.0
                 timing_state['max_update_lag_ms'] = max(timing_state['max_update_lag_ms'], lag_ms)
                 log_fp.write(f"{elapsed:.6f},{pt['ground_bw']:.6f},{pt['ground_lat']:.6f},{g_extra},"
                              f"{pt['sky_bw']:.6f},{pt['sky_lat']:.6f},{s_extra},"
-                             f"{applied:.6f},{lag_ms:.3f},{skipped}\n")
+                             f"{applied:.6f},{lag_ms:.3f},{skipped},{scheduled:.9f},"
+                             f"{tc_apply_ms:.3f},{command_count},{batch_count}\n")
                 log_fp.flush()
-                # 使用绝对 tick，耗时不累积到下一次 sleep；迟到与跳帧写入归档。
-                tick = max(tick + 1, int(applied / granularity) + 1)
-                stop_event.wait(max(0.0, start_time + tick * granularity - time.monotonic()))
+                # Wake at jitter boundaries as well as the original absolute 10ms grid.
+                # Do not replay expired events in a burst or conceal missed events.
+                scheduled = (int(applied / granularity) + 1) * granularity
+                next_event = bisect.bisect_right(frame_times, applied)
+                if next_event < len(frame_times):
+                    scheduled = min(scheduled, frame_times[next_event])
+                stop_event.wait(max(0.0, start_time + scheduled - time.monotonic()))
     except Exception as exc:
         errors.append(str(exc))
         info(f"*** Link updater failed: {exc} ***\n")
         stop_event.set()
     finally:
+        updater.close()
         if reader is not None:
             reader.close()
 
@@ -392,6 +400,13 @@ def run():
     preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
     gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
     scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
+    run_tag = os.environ.get('RUN_TAG') or (
+        f"{'gst_' if video_mode == 'gst' else ''}cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
+        + time.strftime('%Y%m%d_%H%M%S') + f"_{time.time_ns() % 1000000000:09d}")
+    if run_tag in ('.', '..') or not re.fullmatch(r'[A-Za-z0-9_.-]+', run_tag):
+        raise ValueError('RUN_TAG must be a single directory name using letters, numbers, _, - or .')
+    # Reserve before cleaning logs/launching traffic; an existing run is never merged.
+    os.makedirs(os.path.join(cwd, 'runs', run_tag), exist_ok=False)
 
     trace_file = os.path.join(cwd, "Travel.csv")
     ground_thr_path = os.path.join(cwd, "p2p_data/summary_Throughput_ground.tsv")
@@ -648,6 +663,10 @@ def run():
                     'media_config': None if not media else media['config'],
                     'media_control_socket': None if not media else media['control_socket'],
                     'network_jitter_timing_trace': video_trace,
+                    'jitter_calendar': {'events': len(frame_times), 'last_event_time_s': frame_times[-1],
+                        'media_nominal_end_s': None if not media else media['config']['frames'] / media['config']['fps'],
+                        'hold_after_last_event_s': None if not media else max(0.0, media['config']['frames'] / media['config']['fps'] - frame_times[-1]),
+                        'end_policy': 'hold last jitter event; do not loop or extend the input calendar'},
                     'sender_exit': None if sender_proc is None else sender_proc.returncode,
                     'receiver_exit': None if receiver_proc is None else receiver_proc.returncode,
                     'preempt': preempt_cfg, 'gop_size': gop_size_cfg, 'scheduler': scheduler_cfg,
@@ -685,6 +704,14 @@ def run():
                  for frame, ts in frame_generated if int(frame) < len(generation_times)] or [0.0])
             if timing_state['frame_generation_lag_max_ms'] > timing_limit_ms:
                 manifest['timing_valid'] = False
+            if frame_generated:
+                first_frame, first_ts = min(frame_generated, key=lambda item: int(item[0]))
+                first_lag_us = int(first_ts) - int(origin[1]) - int(generation_times[int(first_frame)] * 1_000_000)
+                timing_state['source_startup_lag_ms'] = first_lag_us / 1000
+                timing_state['source_pacing_lag_max_ms'] = max(
+                    [max(0.0, (int(ts) - int(origin[1]) - first_lag_us) / 1000
+                         - generation_times[int(frame)] * 1000)
+                     for frame, ts in frame_generated if int(frame) < len(generation_times)] or [0.0])
         else:
             status = manifest['status'] = 'failed'
             manifest['timing_valid'] = False
@@ -718,11 +745,12 @@ def run():
             errors.append('Missing sender/receiver qlog after process shutdown')
         if media:
             manifest['media_output_valid'] = manifest['media_output_valid'] and status == 'completed'
+        # Keep timing flags consistent if final frame/qlog validation failed.
+        manifest['timing_valid'] = manifest['timing_valid'] and status == 'completed'
+        manifest['network_replay_timing_valid'] = status == 'completed' and not errors and timing_state['frames_skipped'] == 0 and timing_state['max_update_lag_ms'] <= timing_limit_ms
+        manifest['source_timing_valid'] = bool(origin) and status == 'completed' and timing_state.get('frame_generation_lag_max_ms', float('inf')) <= timing_limit_ms
         with open(os.path.join(cwd, 'run_manifest.json'), 'w') as fp:
             json.dump(manifest, fp, indent=2)
-        run_tag = os.environ.get('RUN_TAG') or (
-            f"{'gst_' if media else ''}cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
-            + time.strftime('%Y%m%d_%H%M%S') + f"_{time.time_ns() % 1000000000:09d}")
         archive_dir = archive_run(cwd, run_tag)
         archive_media(media, archive_dir)
         info(f"*** Experiment {status}; timing_valid={manifest['timing_valid']} ***\n")
