@@ -7,6 +7,22 @@
 
 int main(void)
 {
+    media_config_t cfg = {.width = 1920, .height = 1080, .fps = 30, .frames = 300,
+        .bitrate_kbps = 6000, .gop = 30, .playout_ms = 200, .decode_margin_ms = 20,
+        .stream_window_bytes = 1048576, .connection_window_bytes = 8388608};
+    assert(media_config_valid(&cfg));
+    assert(media_priority_override(&cfg, MEDIA_FLAG_IDR | MEDIA_FLAG_PRIORITY_I) == -1);
+    cfg.i_priority = 1;
+    assert(media_priority_override(&cfg, MEDIA_FLAG_IDR | MEDIA_FLAG_PRIORITY_I) == 0);
+    assert(media_priority_override(&cfg, MEDIA_FLAG_IDR) == -1);
+    cfg.all_bp = 1;
+    assert(media_priority_override(&cfg, MEDIA_FLAG_IDR | MEDIA_FLAG_PRIORITY_I) == -1);
+    cfg.stream_window_bytes = 65535; cfg.connection_window_bytes = 1048576;
+    assert(media_config_valid(&cfg)); /* v1 window sizes remain an explicit control. */
+    cfg.connection_window_bytes = 65534;
+    assert(!media_config_valid(&cfg));
+    cfg.connection_window_bytes = 33554433;
+    assert(!media_config_valid(&cfg));
     assert(media_crc32((const uint8_t *)"123456789", 9) == 0xcbf43926u);
     uint8_t number[8]; media_write_u64(number, UINT64_C(0x0102030405060708));
     assert(!memcmp(number, "\x01\x02\x03\x04\x05\x06\x07\x08", 8));

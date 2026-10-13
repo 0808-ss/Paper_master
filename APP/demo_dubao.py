@@ -233,7 +233,7 @@ class MPQUICVideoTopo(Topo):
 
 def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_event,
                                       sender_log, errors, timing_state, granularity=0.01,
-                                      log_file=None, jitter_file=None):
+                                      log_file=None, jitter_file=None, tc_updater=None):
     """在与 Linux picoquic 相同的 CLOCK_MONOTONIC 时间轴回放预计算参数。"""
     rng = random.Random(RANDOM_SEED)
     jitter = []
@@ -252,8 +252,13 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
     start_time = None
     previous_frame = -1
     reader = None
-    updater = TCUpdater(links)
+    updater = tc_updater
+    owns_updater = tc_updater is None
     try:
+        if updater is None:
+            updater = TCUpdater(links, backend=os.environ.get('TC_BACKEND', 'persistent'))
+        timing_state['tc_backend'] = updater.backend
+        timing_state['tc_process_starts'] = updater.process_starts
         if jitter_file:
             # Independent of live encoder frames/bitrate; preserve the old network calendar.
             with open(jitter_file, 'w') as jitter_fp:
@@ -297,6 +302,7 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
                           (pt['sky_bw'], max(0.1, pt['sky_lat'] + s_extra))]
                 apply_begin = time.monotonic()
                 previous, command_count, batch_count = updater.apply(previous, values)
+                timing_state['tc_process_starts'] = updater.process_starts
                 applied = time.monotonic() - start_time
                 tc_apply_ms = (time.monotonic() - apply_begin) * 1000.0
                 timing_state['max_tc_apply_ms'] = max(timing_state.get('max_tc_apply_ms', 0.0), tc_apply_ms)
@@ -321,7 +327,12 @@ def dynamic_link_updater_with_jitter(net, prepared_trace, frame_times, stop_even
         info(f"*** Link updater failed: {exc} ***\n")
         stop_event.set()
     finally:
-        updater.close()
+        if updater is not None and owns_updater:
+            try:
+                updater.close()
+            except Exception as exc:
+                errors.append(str(exc))
+                stop_event.set()
         if reader is not None:
             reader.close()
 
@@ -400,6 +411,9 @@ def run():
     preempt_cfg = os.environ.get("PREEMPT_CFG", PREEMPT_CONFIG)
     gop_size_cfg = os.environ.get("GOP_SIZE_CFG", GOP_SIZE_CONFIG)
     scheduler_cfg = os.environ.get("SCHEDULER_CFG", SCHEDULER_CONFIG)
+    tc_backend = os.environ.get('TC_BACKEND', 'persistent')
+    if tc_backend not in ('persistent', 'batch'):
+        raise ValueError('TC_BACKEND must be persistent or batch')
     run_tag = os.environ.get('RUN_TAG') or (
         f"{'gst_' if video_mode == 'gst' else ''}cfg_{preempt_cfg}_gop{gop_size_cfg}_{scheduler_cfg}_"
         + time.strftime('%Y%m%d_%H%M%S') + f"_{time.time_ns() % 1000000000:09d}")
@@ -555,6 +569,7 @@ def run():
     log_csv = os.path.join(cwd, "link_metrics.csv")
     jitter_csv = os.path.join(cwd, 'network_jitter_events.csv')
     sender_proc = receiver_proc = tail_proc = update_thread = None
+    tc_updater = None
     send_fp = recv_fp = None
     status = 'failed'
     first = prepared_trace[0]
@@ -572,6 +587,8 @@ def run():
                               (links[1], first['sky_bw'], first['sky_lat'])):
             for intf in (link.intf1, link.intf2):
                 safe_update_tc(intf, bw, f"{max(0.1, lat):.2f}ms", initialize=True)
+        # Prepare/verify persistent tc before either media process can publish START.
+        tc_updater = TCUpdater(links, backend=tc_backend)
         info("*** Starting Receiver ***\n")
         receiver_command = media['receiver_command'] if media else [receiver_bin, '12345', cert_file, key_file]
         receiver_proc = h2.popen(receiver_command,
@@ -588,7 +605,7 @@ def run():
         update_thread = threading.Thread(target=dynamic_link_updater_with_jitter,
             args=(net, prepared_trace, frame_times, stop_event,
                   os.path.join(cwd, 'send.log'), errors, timing_state),
-            kwargs={'log_file': log_csv, 'jitter_file': jitter_csv})
+            kwargs={'log_file': log_csv, 'jitter_file': jitter_csv, 'tc_updater': tc_updater})
         update_thread.start()
         tail_proc = subprocess.Popen(['tail', '-f', os.path.join(cwd, 'send.log'),
                                       os.path.join(cwd, 'recv.log')])
@@ -626,6 +643,11 @@ def run():
         stop_event.set()
         if update_thread is not None:
             update_thread.join()
+        if tc_updater is not None:
+            try:
+                tc_updater.close()
+            except Exception as exc:
+                errors.append(str(exc))
         # 对本次 Popen 进程发信号并 wait，接收端处理信号后释放 QUIC/转换 qlog。
         for proc, graceful_signal in ((sender_proc, signal.SIGTERM),
                                       (receiver_proc, signal.SIGINT),
@@ -663,6 +685,7 @@ def run():
                     'media_config': None if not media else media['config'],
                     'media_control_socket': None if not media else media['control_socket'],
                     'network_jitter_timing_trace': video_trace,
+                    'tc_backend': tc_backend,
                     'jitter_calendar': {'events': len(frame_times), 'last_event_time_s': frame_times[-1],
                         'media_nominal_end_s': None if not media else media['config']['frames'] / media['config']['fps'],
                         'hold_after_last_event_s': None if not media else max(0.0, media['config']['frames'] / media['config']['fps'] - frame_times[-1]),

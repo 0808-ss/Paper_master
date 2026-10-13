@@ -19,6 +19,33 @@ def physical_path(address):
     return None
 
 
+def non_new_runs(played):
+    runs = []
+    for index, row in enumerate(played):
+        if row['status'] == 'new':
+            continue
+        shown = int(row['displayed_source_frame_id'])
+        if (runs and runs[-1]['end_frame'] == index - 1 and runs[-1]['status'] == row['status']
+                and runs[-1]['displayed_source_frame_id'] == shown):
+            runs[-1]['end_frame'] = index
+        else:
+            runs.append({'start_frame': index, 'end_frame': index,
+                         'status': row['status'], 'displayed_source_frame_id': shown})
+    return runs
+
+
+def deadline_evidence(index, cfg, encoded, played, received):
+    arrival = int(received[index].get('received_us', 0))
+    cutoff = int(played[index]['deadline_us']) - cfg.get('decode_margin_ms', 20) * 1000
+    ready = int(encoded[index]['encoded_ready_mono_us'])
+    return {'frame_id': index, 'idr': int(encoded[index].get('idr', 0)),
+            'au_bytes': int(encoded[index]['au_bytes']), 'playout_status': played[index]['status'],
+            'decode_state': received[index].get('decode'), 'decode_cutoff_us': cutoff,
+            'received_us': arrival or None,
+            'arrival_minus_decode_cutoff_ms': (arrival - cutoff) / 1000 if arrival else None,
+            'encoded_to_received_ms': (arrival - ready) / 1000 if arrival else None}
+
+
 def path_evidence(run, send_text, streams):
     """Matched media packets from qlog CSV; address mapping from the sender API."""
     mappings = {}
@@ -137,6 +164,13 @@ def build_report(run):
     state_counts = Counter(row['status'] for row in played)
     frame_lags = [(value - origin_us) / 1000 - index * 1000 / fps
                   for index, value in enumerate(source_times)]
+    affected_runs = non_new_runs(played)
+    evidence_ids = {0} | {index for index, row in enumerate(encoded) if int(row.get('idr', 0))}
+    evidence_ids |= {row['start_frame'] for row in affected_runs}
+    evidence_ids |= {row['end_frame'] + 1 for row in affected_runs if row['end_frame'] + 1 < count}
+    flow_records = [dict(zip(('local_stream_window', 'peer_stream_window', 'local_connection_window',
+                              'peer_connection_window'), map(int, match.groups()))) for match in re.finditer(
+        r'\[FLOW_CONTROL\] local_stream_window=(\d+) peer_stream_window=(\d+) local_connection_window=(\d+) peer_connection_window=(\d+)', send_text)]
     return {
         'run_dir': str(run), 'source_git_head': manifest.get('source_git_head'),
         'config': cfg, 'status': manifest['status'],
@@ -145,6 +179,14 @@ def build_report(run):
         'source_timing_valid': manifest.get('source_timing_valid'),
         'timing': manifest.get('timing'),
         'jitter_calendar': manifest.get('jitter_calendar'),
+        'flow_control': {'negotiated_at_sender': flow_records,
+                         'au_over_initial_peer_window_frames': [int(value) for value in re.findall(
+                             r'\[AU_FLOW_WINDOW\] frame=(\d+)', send_text)],
+                         'scope': 'Initial credit is not a cwnd or bandwidth estimate; large AUs may need additional MAX_STREAM_DATA credit'},
+        'deadline_diagnostics': {'non_new_runs': affected_runs,
+                                 'keyframes_and_recovery_boundaries': [deadline_evidence(index, cfg, encoded, played, received)
+                                                                      for index in sorted(evidence_ids)],
+                                 'scope': 'Positive arrival-minus-cutoff means late complete AU; decoded state alone does not imply timely playout'},
         'encoded_load': {'au_bytes': au_bytes, 'nominal_seconds': duration,
                          'source_wall_seconds': source_wall_seconds,
                          'encoded_kbps': au_bytes * 8 / duration / 1000,

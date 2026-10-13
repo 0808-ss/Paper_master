@@ -29,7 +29,15 @@ int media_config_valid(const media_config_t *c)
         c->fps >= 1 && c->fps <= 120 && c->frames > 0 && c->frames <= MEDIA_MAX_FRAMES &&
         c->bitrate_kbps >= 100 && c->bitrate_kbps <= 100000 && c->gop > 0 && c->gop <= 600 &&
         c->playout_ms >= 20 && c->playout_ms <= 5000 &&
-        c->decode_margin_ms < c->playout_ms;
+        c->decode_margin_ms < c->playout_ms && (c->i_priority == 0 || c->i_priority == 1) &&
+        c->stream_window_bytes >= 65535 && c->stream_window_bytes <= 32u * 1024u * 1024u &&
+        c->connection_window_bytes >= c->stream_window_bytes && c->connection_window_bytes <= 32u * 1024u * 1024u;
+}
+
+int media_priority_override(const media_config_t *c, uint32_t flags)
+{
+    /* Leave other stream priorities and the existing preemption/drop mechanism alone. */
+    return c && c->i_priority && !c->all_bp && (flags & MEDIA_FLAG_PRIORITY_I) ? 0 : -1;
 }
 
 static int contains_nal(const uint8_t *p, size_t n, int idr_only)

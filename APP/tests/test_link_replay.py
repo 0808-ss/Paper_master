@@ -1,12 +1,13 @@
 """Remote-only TC regression checks; use fake nodes, never configure host TC."""
 import subprocess
+import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from link_replay import TCUpdater, change_commands, run_batch
+from link_replay import PersistentTC, TCUpdater, change_commands, run_batch
 
 
 class FakeProcess:
@@ -61,7 +62,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_two_paths_use_three_batches_and_four_delay_commands(self):
         links, nodes = self.topology()
-        updater = TCUpdater(links)
+        updater = TCUpdater(links, backend='batch')
         try:
             updated, commands, batches = updater.apply([(6, 10), (5, 20)], [(6, 15), (5, 25)])
         finally:
@@ -73,7 +74,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_threshold_accumulates_from_last_applied_property(self):
         links, _ = self.topology()
-        updater = TCUpdater(links)
+        updater = TCUpdater(links, backend='batch')
         try:
             previous, _, _ = updater.apply([(6, 10), (5, 20)], [(6.06, 11), (5, 20)])
             self.assertEqual(previous[0], (6, 11))
@@ -85,7 +86,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_failure_is_reported_and_input_state_is_not_mutated(self):
         links, nodes = self.topology(code=2)
-        updater = TCUpdater(links)
+        updater = TCUpdater(links, backend='batch')
         previous = [(6, 10), (5, 20)]
         try:
             with self.assertRaisesRegex(RuntimeError, 'injected failure'):
@@ -101,6 +102,126 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
             run_batch(node, ['qdisc change'])
         self.assertTrue(proc.killed)
+
+    def test_persistent_backend_reuses_three_workers(self):
+        links, _ = self.topology()
+        created = []
+        class Worker:
+            def __init__(self, node):
+                self.calls, self.closed = [], False
+                created.append(self)
+            def apply(self, commands):
+                self.calls.append(commands)
+            def close(self):
+                self.closed = True
+        updater = TCUpdater(links, worker_factory=Worker)
+        try:
+            previous, _, _ = updater.apply([(6, 10), (5, 20)], [(6, 15), (5, 25)])
+            updater.apply(previous, [(6, 20), (5, 30)])
+            self.assertEqual(updater.process_starts, 3)
+            self.assertEqual([len(worker.calls) for worker in created], [2, 2, 2])
+        finally:
+            updater.close()
+        self.assertTrue(all(worker.closed for worker in created))
+
+    def test_worker_preparation_failure_closes_other_workers(self):
+        links, _ = self.topology()
+        created = []
+        class Worker:
+            def __init__(self, node):
+                if node.name == 'h1':
+                    raise RuntimeError('injected prepare failure')
+                self.closed = False
+                created.append(self)
+            def close(self):
+                self.closed = True
+        with self.assertRaisesRegex(RuntimeError, 'prepare failure'):
+            TCUpdater(links, worker_factory=Worker)
+        self.assertEqual(len(created), 2)
+        self.assertTrue(all(worker.closed for worker in created))
+
+
+class PipeProcess:
+    """Fake tc over real Linux pipes; no subprocess, qdisc or network mutation."""
+    def __init__(self, mode='success'):
+        self.returncode, self.mode, self.requests, self.killed = None, mode, [], False
+        out_r, self.out_w = os.pipe()
+        err_r, self.err_w = os.pipe()
+        self.stdout, self.stderr = os.fdopen(out_r, 'rb', buffering=0), os.fdopen(err_r, 'rb', buffering=0)
+        self.stdin = SimpleNamespace(write=self.write, close=self.finish)
+    def write(self, payload):
+        self.requests.append(payload)
+        if len(self.requests) == 1 or self.mode == 'success':
+            # A complete JSON fence deliberately has no newline.
+            os.write(self.out_w, b'[]')
+        elif self.mode == 'error':
+            os.write(self.err_w, b'RTNETLINK injected failure\n')
+            self.returncode = 1
+        elif self.mode == 'invalid':
+            os.write(self.out_w, b'{}')
+        return len(payload)
+    def poll(self):
+        return self.returncode
+    def finish(self):
+        if self.returncode is None:
+            self.returncode = 0
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired('fake tc', timeout)
+        for field in ('out_w', 'err_w'):
+            fd = getattr(self, field)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, field, None)
+        return self.returncode
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Persistent tc pipe control targets remote Linux')
+class PersistentPipeTests(unittest.TestCase):
+    def worker(self, mode='success'):
+        proc = PipeProcess(mode)
+        def popen(args, **kwargs):
+            self.assertEqual(args, ['stdbuf', '-o0', '-e0', 'tc', '-j', '-batch', '-'])
+            self.assertNotIn('-force', args)
+            return proc
+        worker = PersistentTC(SimpleNamespace(name='h1', popen=popen), timeout=.03)
+        return worker, proc
+
+    def test_fence_waits_for_complete_json_without_newline_and_reuses_process(self):
+        worker, proc = self.worker()
+        try:
+            worker.apply(['class change dev h1-eth0'])
+            worker.apply(['qdisc change dev h1-eth0'])
+            self.assertEqual(len(proc.requests), 3)  # one preparation query + two updates
+            self.assertTrue(all(payload.endswith(b'qdisc show dev lo\n') for payload in proc.requests))
+        finally:
+            worker.close()
+        self.assertFalse(proc.killed)
+
+    def test_timeout_kills_worker_and_forbids_stale_reply_reuse(self):
+        worker, proc = self.worker('timeout')
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            worker.apply(['class change'])
+        self.assertTrue(proc.killed)
+        with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+            worker.apply([])
+        worker.close()
+
+    def test_command_failure_propagates_stderr_without_success_fence(self):
+        worker, _ = self.worker('error')
+        with self.assertRaisesRegex(RuntimeError, 'RTNETLINK injected failure'):
+            worker.apply(['class change'])
+        worker.close()
+
+    def test_invalid_json_shape_fails_and_kills_worker(self):
+        worker, proc = self.worker('invalid')
+        with self.assertRaisesRegex(RuntimeError, 'invalid JSON'):
+            worker.apply(['class change'])
+        self.assertTrue(proc.killed)
+        worker.close()
 
 
 if __name__ == '__main__':

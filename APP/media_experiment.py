@@ -47,6 +47,9 @@ def prepare_media(cwd, preempt, gop, scheduler):
         "preempt": int(preempt), "all_bp": int(int(gop) == 0), "scheduler": scheduler,
         "pattern": os.environ.get("MEDIA_PATTERN", "ball"),
         "preview": integer("MEDIA_PREVIEW", 0, 0, 1),
+        "i_priority": integer("MEDIA_I_PRIORITY", 0, 0, 1),
+        "stream_window_bytes": integer("MEDIA_STREAM_WINDOW_BYTES", 1048576, 65535, 33554432),
+        "connection_window_bytes": integer("MEDIA_CONNECTION_WINDOW_BYTES", 8388608, 65535, 33554432),
     }
     if cfg["width"] % 2 or cfg["height"] % 2 or cfg["decode_margin_ms"] >= cfg["playout_ms"]:
         raise ValueError("I420 requires even dimensions; decode margin must be below playout buffer")
@@ -54,6 +57,8 @@ def prepare_media(cwd, preempt, gop, scheduler):
         raise ValueError("Invalid preemption/scheduler config")
     if cfg["pattern"] not in ("ball", "zone-plate", "smpte", "snow"):
         raise ValueError("MEDIA_PATTERN must be ball, zone-plate, smpte or snow")
+    if cfg['connection_window_bytes'] < cfg['stream_window_bytes']:
+        raise ValueError('Connection flow-control window must cover the stream window')
     run_id = f"{os.getpid()}_{time.time_ns()}"
     root = os.path.join(cwd, "media_work", run_id)
     os.makedirs(root)
@@ -66,11 +71,15 @@ def prepare_media(cwd, preempt, gop, scheduler):
     for flag, name in (("width", "width"), ("height", "height"), ("fps", "fps"), ("frames", "frames"),
                        ("bitrate", "bitrate_kbps"), ("gop", "gop"), ("preempt", "preempt"),
                        ("all-bp", "all_bp"), ("scheduler", "scheduler"), ("playout-ms", "playout_ms"),
-                       ("decode-margin-ms", "decode_margin_ms"), ("pattern", "pattern")):
+                       ("decode-margin-ms", "decode_margin_ms"), ("pattern", "pattern"),
+                       ("i-priority", "i_priority"), ("stream-window", "stream_window_bytes"),
+                       ("connection-window", "connection_window_bytes")):
         sender.extend(["--" + flag, str(cfg[name])])
     sender.extend(["--output", sender_dir, "--control-socket", control])
     receiver = [os.path.join(cwd, "video_receiver_gst"), "12345", os.path.join(cwd, "cert.pem"),
                 os.path.join(cwd, "key.pem"), "--output", receiver_dir, "--preview", str(cfg["preview"])]
+    receiver.extend(['--stream-window', str(cfg['stream_window_bytes']),
+                     '--connection-window', str(cfg['connection_window_bytes'])])
     return {"config": cfg, "root": root, "control_socket": control,
             "sender_command": sender, "receiver_command": receiver,
             "frame_times": [i / fps for i in range(cfg["frames"])]}

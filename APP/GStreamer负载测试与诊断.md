@@ -48,20 +48,22 @@ flowchart LR
 
 ## 远端同步与基础检查（仅在远端执行）
 
-本地不编译、不运行程序或测试。版本标签 `gst-load-fix-v1`，修改仅外层 APP 和记录文档；picoquic 保持 `94f48cb746de101fbb88aee5decfe14b28b04496`，无需新 bundle 或重编译库。因为本轮改了媒体 C 文件，必须重编译媒体二进制。
+本地不编译、不运行程序或测试。当前版本标签 `gst-load-fix-v2`，修改仅外层 APP 和记录文档；picoquic 保持 `94f48cb746de101fbb88aee5decfe14b28b04496`，无需新 bundle 或重编译库。因为本轮改了媒体 C 文件及配置头，必须重编译媒体二进制。
 
 ```bash
 cd /home/duwenji/ljy/Paper_master
 # 本地修补提交发布后，拉取对应版本；远端有改动时先自行保留。
 git pull --ff-only origin main
-git fetch origin tag gst-load-fix-v1
+git fetch origin tag gst-load-fix-v2
 git rev-parse HEAD
-git rev-parse gst-load-fix-v1^{commit}
+git rev-parse 'gst-load-fix-v2^{commit}'
 git submodule status
 cd APP
 make -B media
 make media-protocol-check
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
+# 只查询本机 loopback 的 qdisc；验证持久 tc 的 JSON 完成响应，不修改网络。
+sudo /usr/bin/python3 tests/check_tc_persistent.py
 pkg-config --modversion gstreamer-1.0
 ldd ./video_sender_gst
 ldd ./video_receiver_gst
@@ -70,7 +72,60 @@ df -h .
 
 新增 13 项远端回归用例：TC 的选择性 change、参数拒绝、batch 分组、阈值累计、失败传播、超时清理；负载的目标/实测区别、编码停顿、启动偏移、完整但冻结、媒体路径过滤、无路径 qlog、部分准入。这里写的是待执行用例，不是已经通过的测试结果。
 
+v2 在这 13 项之上增加 11 项 Python 用例，以及 C 协议检查中的配置/优先级断言。新增用例覆盖持久进程复用、准备失败清理、JSON 响应、TC 错误、超时后禁止复用、实际迟到与恢复边界、两端窗口参数及优先级与丢弃独立性。Linux pipe 用例和只读兼容性检查仅在远端执行，本地不以 AST 检查替代运行通过证据。
+
 仍按已有验收文档统一 GStreamer 工具、插件、编译库和运行库环境；不要混用 conda 工具与另一路系统插件。
+
+## 第二轮反馈修补：持久 TC 与媒体流控窗口（v2）
+
+v1 的 1080p / snow / 6000 kbit/s / 300 帧远端结果已确认：实际编码/准入均 6092.6 kbit/s，300 AU 完整收到；两路径媒体承载通过，地面 3966 包、空中 1751 包。源时序通过（启动偏移 31.194 ms、后续最大偏差 0.084 ms），但网络回放跳过 1 个时点、更新最大滞后 33.093 ms；4.800 s 对应 TC 更新 32.960 ms，属于视频有效区间内，不是排空期间误报。
+
+首 AU 为 275440 字节，编码耗时 18.228 ms，编码完成到完整接收为 630.778 ms。其完整接收比解码准入截止期晚 500.200 ms，引发槽 0～29 黑屏，帧 30 IDR 恢复。帧 107、108、109 分别晚于准入截止期 69.499、52.017、21.693 ms；110～119 等待 IDR，槽 107～119 重复帧 106，帧 120 IDR 恢复。这些是完整但迟到的 AU，不是 CRC 损坏或永久缺帧。
+
+库源码的默认单向流额度为 65535 字节，默认连接额度 1048576 字节，普通流优先级为 9（同级 FIFO）。首 AU 加封装为 280136 字节，超过默认单流额度；需要 MAX_STREAM_DATA 更新，流控受阻时后续较小流可以先完成。此参数不匹配是可验证的停顿因素，尚不能仅靠汇总断言 630.778 ms 全由流控造成；I/BP 同级并不等于流级 RR。
+
+v2 改动：
+
+- `TC_BACKEND=persistent` 为新默认。按节点在共同起点前创建 3 个常驻 `tc -j -batch -`，复用进程及 netlink socket；每组 change 后追加只读 `qdisc show dev lo`，等完整 JSON 查询结果作为前序命令完成的确认。不开 `-force`；change 失败使 tc 在确认查询前退出。遇到退出、EOF、超时或非法响应就终止该 worker，不复用可能迟到的响应。关闭时只结束自有进程，不清理任何 qdisc。`tc_process_starts` 正常为 3，`tc_batches` 仍表示更新批次，`tc_commands` 不包含确认查询。
+- 显式 `TC_BACKEND=batch` 可对照 v1 的每次派生进程方式；不静默回退。需要 coreutils 的 stdbuf 和 tc 的 JSON/batch 支持；先执行只读兼容性检查。实现依据：[iproute2 v5.5 的顺序 batch 循环及逐命令刷新](https://github.com/iproute2/iproute2/blob/v5.5.0/tc/tc.c)、[完成查询的 JSON 输出](https://github.com/iproute2/iproute2/blob/v5.5.0/tc/tc_qdisc.c)。
+- 媒体模式默认将两端接收单向流额度设为 1 MiB、连接额度设为 8 MiB，在连接创建/握手前配置。分别由 `MEDIA_STREAM_WINDOW_BYTES` / `MEDIA_CONNECTION_WINDOW_BYTES` 覆盖；范围 65535～32 MiB，连接额度不得小于单流额度。流控额度不是拥塞窗口，不绕过 NewReno/cwnd/pacing，也不预分配额度大小的缓存；既有接收/排序内存上限仍会使超限实验失败。大于单流初始额度的 AU 仍可能需要追加信用。
+- `[FLOW_CONTROL]` 记录实际本地/对端协商额度；`[AU_FLOW_WINDOW]` 记录超过对端初始额度的 AU。判断传输参数以该记录为准，而不是只看请求值。接收端保存的是本地配置；sender 配置和 manifest 为发送策略依据。
+- `MEDIA_I_PRIORITY=0` 为默认，保留原流级调度。显式设 1 后仅对标记为优先 I 的媒体流调用原库 priority=0 API，其他流不改；`PREEMPT_CFG=0` 时不会因此启用 BP 丢弃，`GOP_SIZE_CFG=0` 的 all-BP 仍不提升流。开启原 preempt 后原有 I 优先/BP 丢弃行为仍存在，独立开关不能关闭库机制自身的 I 优先。
+- `load_report.json` 增加实际窗口、黑屏/重复区间、IDR 和恢复边界的接收减准入截止期、编码完成到完整接收时间。差值为正说明迟到。新诊断也可重算旧归档；旧版本没有窗口日志时不伪造协商值。
+
+共享起点、严格时序阈值、200 ms 播放缓冲、20 ms 解码余量、可靠重传、WAIT_IDR、网络日历和 CC 保持原口径。新窗口与可选优先级属于实验配置变化：先固定新版本做对照，不直接把 v1/v2 差异归为某个拥塞算法收益。I 优先不能让已经错过截止期的 P 帧恢复，也不保证首帧一定按时完成。
+
+## v2 最小复验与单因素对照
+
+先重复同一轮 1080p / snow / 6000 kbit/s / 10 秒，保持 preempt=0、I priority=0，只验证常驻 TC 和新窗口。分析目录由 sudo 实验创建，因此分析也使用 sudo。
+
+```bash
+RUN_TAG="gst_v2_window_$(date +%Y%m%d_%H%M%S)_$$"
+sudo env VIDEO_MODE=gst TC_BACKEND=persistent \
+  MEDIA_WIDTH=1920 MEDIA_HEIGHT=1080 MEDIA_FPS=30 MEDIA_FRAMES=300 \
+  MEDIA_BITRATE_KBPS=6000 MEDIA_GOP=30 MEDIA_PATTERN=snow MEDIA_PREVIEW=0 \
+  MEDIA_PLAYOUT_MS=200 MEDIA_DECODE_MARGIN_MS=20 \
+  MEDIA_I_PRIORITY=0 MEDIA_STREAM_WINDOW_BYTES=1048576 MEDIA_CONNECTION_WINDOW_BYTES=8388608 \
+  PREEMPT_CFG=0 GOP_SIZE_CFG=30 SCHEDULER_CFG=rr \
+  NETWORK_JITTER_TIMING_TRACE="$PWD/4k_30f_trace_0.8.csv" RUN_TAG="$RUN_TAG" \
+  /usr/bin/python3 demo_dubao.py
+sudo /usr/bin/python3 qlog_delay_scatter.py --run-dir "runs/$RUN_TAG" --clock-mode same-clock
+sudo /usr/bin/python3 media_load.py "runs/$RUN_TAG" \
+  --min-encoded-kbps 4500 --min-admitted-kbps 4500 --require-timing --require-multipath
+/usr/bin/python3 -m json.tool "runs/$RUN_TAG/run_manifest.json"
+/usr/bin/python3 -m json.tool "runs/$RUN_TAG/load_report.json"
+```
+
+在新版本上逐轮修改以下参数，其他配置、输入、播放缓冲均相同；每轮换 RUN_TAG，不同时运行多个 demo。
+
+| 对照组 | TC_BACKEND | 单流/连接初始额度（字节） | MEDIA_I_PRIORITY | 目的 |
+|---|---|---|---|---|
+| A | batch | 65535 / 1048576 | 0 | 复现 v1 配置 |
+| B | persistent | 65535 / 1048576 | 0 | 单独核对进程复用与 TC 时序 |
+| C | persistent | 1048576 / 8388608 | 0 | 相对 B 核对流控窗口与关键帧时延 |
+| D | persistent | 1048576 / 8388608 | 1 | 相对 C 核对 I 优先的额外影响 |
+
+上述最小复验对应 C 组，方便先确认新默认能否达标；归因需要补 A/B/D 组并重复多轮。不要通过提高验收阈值或将共享起点移到第一帧来“通过”时序。v2 本地仅静态检查，常驻 tc 的远端兼容性、性能收益和首 IDR 改善仍待运行确认。
 
 ## 分阶段执行
 

@@ -184,6 +184,9 @@ static int transport_callback(picoquic_cnx_t *cnx, uint64_t sid, uint8_t *bytes,
     if (event == picoquic_callback_ready) {
         t->connected = 1; save_path(t, 0);
         printf("[CC] algorithm=%s\n", cnx->congestion_alg ? cnx->congestion_alg->congestion_algorithm_id : "unknown");
+        printf("[FLOW_CONTROL] local_stream_window=%" PRIu64 " peer_stream_window=%" PRIu64 " local_connection_window=%" PRIu64 " peer_connection_window=%" PRIu64 "\n",
+            cnx->local_parameters.initial_max_stream_data_uni, cnx->remote_parameters.initial_max_stream_data_uni,
+            cnx->local_parameters.initial_max_data, cnx->remote_parameters.initial_max_data);
         if (t->sender) {
             int allowed = 0; picoquic_subscribe_new_path_allowed(cnx, &allowed);
             media_control_record_t r = {0}; r.type = MEDIA_SETTINGS;
@@ -306,6 +309,14 @@ static int send_one_frame(transport_t *t, uint64_t now)
     uint64_t sid = picoquic_get_next_local_stream_id(t->cnx, 1);
     int result = picoquic_add_to_stream_with_frame_type(t->cnx, sid, wire, len, 1,
         f.flags & MEDIA_FLAG_PRIORITY_I ? PICOQUIC_VIDEO_FRAME_I : PICOQUIC_VIDEO_FRAME_BP);
+    int priority = media_priority_override(&t->cfg, f.flags);
+    if (!result && priority >= 0) {
+        result = picoquic_set_stream_priority(t->cnx, sid, (uint8_t)priority);
+        if (!result) printf("[STREAM_PRIORITY] stream=%" PRIu64 " frame=%" PRIu64 " priority=%d\n", sid, f.frame_id, priority);
+    }
+    if (t->cnx->remote_parameters.initial_max_stream_data_uni < len)
+        printf("[AU_FLOW_WINDOW] frame=%" PRIu64 " stream=%" PRIu64 " wire_bytes=%zu initial_peer_window=%" PRIu64 " needs_credit_updates=1\n",
+            f.frame_id, sid, len, t->cnx->remote_parameters.initial_max_stream_data_uni);
     if (!result)
         printf("[STREAM_MAP] stream=%" PRIu64 " frame=%" PRIu64 " size=%zu stream_len=%zu class=%s first_pkt_ts=%" PRIu64 "\n",
             sid, f.frame_id, f.au_len, len, cls, now);
@@ -408,6 +419,8 @@ static int options(int argc, char **argv, int first, transport_t *t)
         else {
             uint32_t n; if (numeric(v, &n)) return -1;
             if (!strcmp(key, "--preview") && !t->sender && n <= 1) t->cfg.preview = (int)n;
+            else if (!strcmp(key, "--stream-window")) t->cfg.stream_window_bytes = n;
+            else if (!strcmp(key, "--connection-window")) t->cfg.connection_window_bytes = n;
             else if (!t->sender) return -1;
             else if (!strcmp(key, "--width")) t->cfg.width = n;
             else if (!strcmp(key, "--height")) t->cfg.height = n;
@@ -418,6 +431,7 @@ static int options(int argc, char **argv, int first, transport_t *t)
             else if (!strcmp(key, "--playout-ms")) t->cfg.playout_ms = n;
             else if (!strcmp(key, "--decode-margin-ms")) t->cfg.decode_margin_ms = n;
             else if (!strcmp(key, "--preempt") && n <= 1) t->cfg.preempt = (int)n;
+            else if (!strcmp(key, "--i-priority") && n <= 1) t->cfg.i_priority = (int)n;
             else if (!strcmp(key, "--all-bp") && n <= 1) t->cfg.all_bp = (int)n;
             else return -1;
         }
@@ -432,9 +446,11 @@ static int save_config(const media_config_t *c)
     FILE *fp = fopen(path, "w"); if (!fp) return -1;
     int ret = fprintf(fp, "{\"width\":%u,\"height\":%u,\"fps\":%u,\"frames\":%u,\"bitrate_kbps\":%u,\"gop\":%u,"
         "\"playout_ms\":%u,\"decode_margin_ms\":%u,\"preempt\":%d,\"all_bp\":%d,\"codec\":\"h264\",\"pixel_format\":\"yuv420p\","
-        "\"colorimetry\":\"bt709\",\"bframes\":0,\"pattern\":\"%s\",\"scheduler\":\"%s\",\"cc\":\"newreno\"}\n",
+        "\"colorimetry\":\"bt709\",\"bframes\":0,\"pattern\":\"%s\",\"scheduler\":\"%s\",\"cc\":\"newreno\","
+        "\"i_priority\":%d,\"stream_window_bytes\":%u,\"connection_window_bytes\":%u}\n",
         c->width, c->height, c->fps, c->frames, c->bitrate_kbps, c->gop, c->playout_ms,
-        c->decode_margin_ms, c->preempt, c->all_bp, c->pattern, c->scheduler);
+        c->decode_margin_ms, c->preempt, c->all_bp, c->pattern, c->scheduler,
+        c->i_priority, c->stream_window_bytes, c->connection_window_bytes);
     int close_result = fclose(fp); return ret < 0 || close_result ? -1 : 0;
 }
 
@@ -446,10 +462,10 @@ int media_transport_main(int argc, char **argv, int sender)
     uint64_t last_log_flush = 0;
     transport_t t = {0}; t.sender = sender;
     t.cfg = (media_config_t){1920, 1080, 30, 300, 4000, 30, 200, 20, 1, 0, 0,
-        "ball", "default", sender ? "media_sender" : "media_receiver", "/tmp/picoquic-video.sock"};
+        "ball", "default", sender ? "media_sender" : "media_receiver", "/tmp/picoquic-video.sock", 0, 1048576, 8388608};
     if (argc < (sender ? 3 : 4) || options(argc, argv, sender ? 3 : 4, &t)) {
-        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --all-bp 0|1 --scheduler default|rr|minrtt --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte|snow --output DIR --control-socket PATH]\n" :
-            "Usage: %s <port> <cert.pem> <key.pem> [--output DIR --preview 0|1]\n", argv[0]); return 1;
+        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --i-priority 0|1 --all-bp 0|1 --scheduler default|rr|minrtt --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte|snow --stream-window BYTES --connection-window BYTES --output DIR --control-socket PATH]\n" :
+            "Usage: %s <port> <cert.pem> <key.pem> [--output DIR --preview 0|1 --stream-window BYTES --connection-window BYTES]\n", argv[0]); return 1;
     }
     uint32_t port; if (numeric(argv[sender ? 2 : 1], &port) || port < 1 || port > 65535) return 1;
     /* Output must be a fresh directory: never overwrite the previous experiment. */
@@ -471,6 +487,10 @@ int media_transport_main(int argc, char **argv, int sender)
     quic = picoquic_create(sender ? 1 : 8, sender ? NULL : argv[2], sender ? NULL : argv[3], NULL,
         MEDIA_ALPN, transport_callback, &t, NULL, NULL, NULL, now, NULL, NULL, NULL, 0);
     if (!quic) { t.failed = 1; goto cleanup; }
+    if (picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_stream_data_uni, t.cfg.stream_window_bytes) ||
+        picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_data, t.cfg.connection_window_bytes)) {
+        fail_transport(&t, "media flow-control window configuration failed"); goto cleanup;
+    }
     picoquic_set_default_multipath_option(quic, 1); picoquic_enable_path_callbacks_default(quic, 1);
     picoquic_set_default_tp_value(quic, picoquic_tp_active_connection_id_limit, 8);
     picoquic_set_default_address_discovery_mode(quic, 3);
@@ -491,6 +511,7 @@ int media_transport_main(int argc, char **argv, int sender)
             (!strcmp(t.cfg.scheduler, "minrtt") ? picoquic_multipath_scheduler_minrtt : picoquic_multipath_scheduler_default);
         picoquic_set_multipath_scheduler(t.cnx, scheduler);
         printf("[PREEMPT] enabled=%d\n[SCHED] multipath scheduler=%s\n[GOP] codec_gop=%u all_bp=%d\n", t.cfg.preempt, t.cfg.scheduler, t.cfg.gop, t.cfg.all_bp);
+        printf("[I_PRIORITY] enabled=%d priority=0 bp_default=%d\n", t.cfg.i_priority, PICOQUIC_DEFAULT_STREAM_PRIORITY);
         if (picoquic_start_client_cnx(t.cnx)) { t.failed = 1; goto cleanup; }
     }
     printf("[MEDIA_MODE] sender=%d alpn=%s\n", sender, MEDIA_ALPN);

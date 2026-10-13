@@ -8,7 +8,7 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from media_load import acceptance_errors, build_report
+from media_load import acceptance_errors, build_report, deadline_evidence, non_new_runs
 
 
 class LoadTests(unittest.TestCase):
@@ -115,6 +115,21 @@ class LoadTests(unittest.TestCase):
         report = build_report(self.run)
         self.assertEqual(report['admission']['ratio'], .75)
         self.assertTrue(acceptance_errors(report, min_admitted_kbps=.07))
+
+    def test_late_complete_au_is_distinct_from_missing_transport(self):
+        row = deadline_evidence(0, {'decode_margin_ms': 20},
+            [{'au_bytes': 275440, 'idr': 1, 'encoded_ready_mono_us': 49_422}],
+            [{'deadline_us': 200_000, 'status': 'black'}],
+            [{'received_us': 680_200, 'decode': 'unreceived_deadline'}])
+        self.assertEqual(row['arrival_minus_decode_cutoff_ms'], 500.2)
+        self.assertEqual(row['encoded_to_received_ms'], 630.778)
+
+    def test_frozen_runs_preserve_recovery_boundary(self):
+        rows = [{'status': state, 'displayed_source_frame_id': shown} for state, shown in
+                [('black', 2**64 - 1), ('new', 1), ('repeat', 1), ('repeat', 1), ('new', 4)]]
+        runs = non_new_runs(rows)
+        self.assertEqual([(row['start_frame'], row['end_frame'], row['status']) for row in runs],
+                         [(0, 0, 'black'), (2, 3, 'repeat')])
 
 
 if __name__ == '__main__':

@@ -22,6 +22,8 @@ typedef struct {
     const char *scheduler;
     const char *output_dir;
     const char *control_socket;
+    int i_priority;
+    uint32_t stream_window_bytes, connection_window_bytes;
 } media_config_t;
 
 typedef struct {
@@ -48,6 +50,7 @@ void media_write_u32(uint8_t *, uint32_t);
 void media_write_u64(uint8_t *, uint64_t);
 uint32_t media_crc32(const uint8_t *, size_t);
 int media_config_valid(const media_config_t *);
+int media_priority_override(const media_config_t *, uint32_t flags);
 int media_au_is_idr(const uint8_t *, size_t);
 int media_au_has_vcl(const uint8_t *, size_t);
 int media_frame_pack(const media_frame_t *, uint8_t **, size_t *);
