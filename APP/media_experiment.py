@@ -53,7 +53,7 @@ def prepare_media(cwd, preempt, gop, scheduler):
     }
     if cfg["width"] % 2 or cfg["height"] % 2 or cfg["decode_margin_ms"] >= cfg["playout_ms"]:
         raise ValueError("I420 requires even dimensions; decode margin must be below playout buffer")
-    if cfg["preempt"] not in (0, 1) or scheduler not in ("default", "rr", "minrtt"):
+    if cfg["preempt"] not in (0, 1) or scheduler not in ("default", "rr", "minrtt", "arrival"):
         raise ValueError("Invalid preemption/scheduler config")
     if cfg["pattern"] not in ("ball", "zone-plate", "smpte", "snow"):
         raise ValueError("MEDIA_PATTERN must be ball, zone-plate, smpte or snow")

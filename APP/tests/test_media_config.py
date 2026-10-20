@@ -43,6 +43,16 @@ class MediaConfigTests(unittest.TestCase):
                 self.config(directory, {'MEDIA_CONNECTION_WINDOW_BYTES': '65535'})
             self.assertFalse((Path(directory) / 'media_work').exists())
 
+    def test_arrival_scheduler_reaches_sender_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'MEDIA_WIDTH': '16', 'MEDIA_HEIGHT': '16',
+                                        'MEDIA_FRAMES': '1'}, clear=True):
+                media = prepare_media(directory, '0', '30', 'arrival')
+        self.assertEqual(media['config']['scheduler'], 'arrival')
+        command = media['sender_command']
+        self.assertEqual(command[command.index('--scheduler') + 1], 'arrival')
+        self.assertNotIn('--scheduler', media['receiver_command'])
+
 
 if __name__ == '__main__':
     unittest.main()

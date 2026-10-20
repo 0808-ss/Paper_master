@@ -39,7 +39,7 @@ PICOQUIC_LIBS = ../picoquic/libpicoquic-core.a ../picoquic/libpicoquic-log.a
 all: $(TARGETS)
 
 # Optional: legacy builds do not evaluate pkg-config or require GStreamer.
-.PHONY: all media clean check-gstreamer media-protocol-check
+.PHONY: all media clean check-gstreamer media-protocol-check arrival-scheduler-check
 media: $(MEDIA_TARGETS)
 
 check-gstreamer:
@@ -53,6 +53,11 @@ media-protocol-check:
 	$(CC) $(CFLAGS) -std=c11 -I. tests/media_protocol_test.c media_protocol.c -o media_protocol_test
 	./media_protocol_test
 
+# Remote only: links the same core library as both senders.
+arrival-scheduler-check:
+	$(CC) $(CFLAGS) -std=c11 $(INCLUDES) tests/arrival_scheduler_test.c -o arrival_scheduler_test $(LDFLAGS) $(LIBS)
+	./arrival_scheduler_test
+
 video_receiver: video_receiver.c video_common.h $(PICOQUIC_HEADERS) $(PICOQUIC_LIBS)
 	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS) $(LIBS)
 
@@ -60,4 +65,4 @@ video_sender: video_sender.c video_common.h $(PICOQUIC_HEADERS) $(PICOQUIC_LIBS)
 	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f $(TARGETS) $(MEDIA_TARGETS) media_protocol_test
+	rm -f $(TARGETS) $(MEDIA_TARGETS) media_protocol_test arrival_scheduler_test

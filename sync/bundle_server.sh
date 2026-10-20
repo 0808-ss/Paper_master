@@ -13,8 +13,19 @@ MODE="${2:-ff-only}"
 ROOT="$(git rev-parse --show-toplevel)"
 SUB="$ROOT/picoquic"
 
+if [[ "$(git -C "$SUB" symbolic-ref --short HEAD)" != work ]]; then
+  echo 'picoquic must be on work; preserve local changes and select work first' >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$SUB" status --porcelain --untracked-files=no)" ]]; then
+  echo 'picoquic has tracked changes; preserve them before importing' >&2
+  exit 1
+fi
+EXPECTED="$(git -C "$ROOT" rev-parse HEAD:picoquic)"
+git -C "$SUB" bundle verify "$BUNDLE"
+
 echo "== fetching work from bundle: $BUNDLE"
-git -C "$SUB" fetch "$BUNDLE" 'refs/heads/*:refs/remotes/bundle/*'
+git -C "$SUB" fetch --tags "$BUNDLE" 'refs/heads/*:refs/remotes/bundle/*'
 
 case "$MODE" in
   ff-only) git -C "$SUB" merge --ff-only bundle/work ;;
@@ -22,6 +33,13 @@ case "$MODE" in
   rebase)  git -C "$SUB" rebase bundle/work ;;
   *) echo "unknown mode: $MODE (use ff-only|merge|rebase)" >&2; exit 1 ;;
 esac
+
+ACTUAL="$(git -C "$SUB" rev-parse HEAD)"
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  echo "submodule does not match outer gitlink: expected $EXPECTED, actual $ACTUAL" >&2
+  echo 'Import preserved local history. Resolve the version difference before building.' >&2
+  exit 1
+fi
 
 echo "== submodule status (no + prefix means aligned with the outer pointer):"
 git -C "$ROOT" submodule status

@@ -511,6 +511,8 @@ static void parse_scheduler_config(const char* cfg, picoquic_multipath_scheduler
         *scheduler = picoquic_multipath_scheduler_rr;
     } else if (strcmp(cfg, "minrtt") == 0) {
         *scheduler = picoquic_multipath_scheduler_minrtt;
+    } else if (strcmp(cfg, "arrival") == 0) {
+        *scheduler = picoquic_multipath_scheduler_arrival;
     } else if (strcmp(cfg, "default") != 0) {
         printf("[SCHED] Warning: unknown scheduler '%s', using default\n", cfg);
     }
@@ -521,6 +523,7 @@ static const char* scheduler_name(picoquic_multipath_scheduler_enum scheduler)
     switch (scheduler) {
     case picoquic_multipath_scheduler_rr: return "rr";
     case picoquic_multipath_scheduler_minrtt: return "minrtt";
+    case picoquic_multipath_scheduler_arrival: return "arrival";
     default: return "default";
     }
 }
@@ -550,7 +553,7 @@ int main(int argc, char** argv)
         printf("  gop_size (可选): I 帧间隔帧数，帧索引为 gop_size 整数倍 => I 帧；\n");
         printf("                  0 = 全 BP（无 I 帧标记）；默认 %u（video_common.h 的 GOP_SIZE）\n",
             (unsigned int)GOP_SIZE);
-        printf("  scheduler (可选): default / rr / minrtt（多路径数据包选路策略，默认 default=原版行为）\n");
+        printf("  scheduler (可选): default / rr / minrtt / arrival（多路径数据包选路策略，默认 default=原版行为）\n");
         return 1;
     }
 

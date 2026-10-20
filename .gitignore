@@ -43,6 +43,7 @@ sync/*.bundle
 APP/video_sender_gst
 APP/video_receiver_gst
 APP/media_protocol_test
+APP/arrival_scheduler_test
 APP/media_work/
 APP/runs/
 APP/network_jitter_events.csv

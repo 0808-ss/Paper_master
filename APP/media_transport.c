@@ -438,7 +438,8 @@ static int options(int argc, char **argv, int first, transport_t *t)
     }
     return !media_config_valid(&t->cfg) ||
         (strcmp(t->cfg.pattern, "ball") && strcmp(t->cfg.pattern, "zone-plate") && strcmp(t->cfg.pattern, "smpte") && strcmp(t->cfg.pattern, "snow")) ||
-        (strcmp(t->cfg.scheduler, "default") && strcmp(t->cfg.scheduler, "rr") && strcmp(t->cfg.scheduler, "minrtt")) ? -1 : 0;
+        (strcmp(t->cfg.scheduler, "default") && strcmp(t->cfg.scheduler, "rr") &&
+         strcmp(t->cfg.scheduler, "minrtt") && strcmp(t->cfg.scheduler, "arrival")) ? -1 : 0;
 }
 static int save_config(const media_config_t *c)
 {
@@ -464,7 +465,7 @@ int media_transport_main(int argc, char **argv, int sender)
     t.cfg = (media_config_t){1920, 1080, 30, 300, 4000, 30, 200, 20, 1, 0, 0,
         "ball", "default", sender ? "media_sender" : "media_receiver", "/tmp/picoquic-video.sock", 0, 1048576, 8388608};
     if (argc < (sender ? 3 : 4) || options(argc, argv, sender ? 3 : 4, &t)) {
-        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --i-priority 0|1 --all-bp 0|1 --scheduler default|rr|minrtt --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte|snow --stream-window BYTES --connection-window BYTES --output DIR --control-socket PATH]\n" :
+        fprintf(stderr, sender ? "Usage: %s <server_ip> <port> [--width N --height N --fps N --frames N --bitrate kbps --gop N --preempt 0|1 --i-priority 0|1 --all-bp 0|1 --scheduler default|rr|minrtt|arrival --playout-ms N --decode-margin-ms N --pattern ball|zone-plate|smpte|snow --stream-window BYTES --connection-window BYTES --output DIR --control-socket PATH]\n" :
             "Usage: %s <port> <cert.pem> <key.pem> [--output DIR --preview 0|1 --stream-window BYTES --connection-window BYTES]\n", argv[0]); return 1;
     }
     uint32_t port; if (numeric(argv[sender ? 2 : 1], &port) || port < 1 || port > 65535) return 1;
@@ -508,7 +509,8 @@ int media_transport_main(int argc, char **argv, int sender)
         if (!t.cnx) { t.failed = 1; goto cleanup; }
         picoquic_set_callback(t.cnx, transport_callback, &t); picoquic_set_frame_preemption(t.cnx, t.cfg.preempt);
         picoquic_multipath_scheduler_enum scheduler = !strcmp(t.cfg.scheduler, "rr") ? picoquic_multipath_scheduler_rr :
-            (!strcmp(t.cfg.scheduler, "minrtt") ? picoquic_multipath_scheduler_minrtt : picoquic_multipath_scheduler_default);
+            (!strcmp(t.cfg.scheduler, "minrtt") ? picoquic_multipath_scheduler_minrtt :
+             (!strcmp(t.cfg.scheduler, "arrival") ? picoquic_multipath_scheduler_arrival : picoquic_multipath_scheduler_default));
         picoquic_set_multipath_scheduler(t.cnx, scheduler);
         printf("[PREEMPT] enabled=%d\n[SCHED] multipath scheduler=%s\n[GOP] codec_gop=%u all_bp=%d\n", t.cfg.preempt, t.cfg.scheduler, t.cfg.gop, t.cfg.all_bp);
         printf("[I_PRIORITY] enabled=%d priority=0 bp_default=%d\n", t.cfg.i_priority, PICOQUIC_DEFAULT_STREAM_PRIORITY);

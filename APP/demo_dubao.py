@@ -57,7 +57,8 @@ GOP_SIZE_CONFIG = "30"
 #   default = picoquic 原版选路（min-RTT ACK + 流亲和 + 最近未用，机制不生效）
 #   rr      = Round Robin：按路径索引轮询选择可用路径
 #   minrtt  = 最小 RTT：始终选择 rtt_min 最小的可用路径
-# 只影响数据包在多路径间的选路，不影响路径校验、ACK 与拥塞控制；
+#   arrival = 每 AU 完成时间调度：带宽、RTT/2、CWND、pacing 和已分配待发队列
+# arrival 同时约束 AU/Stream 在每条路径上的成包预算；保留路径校验、ACK 与拥塞控制；
 # 单路径连接下该配置无效。
 # 可用环境变量 SCHEDULER_CFG 覆盖（便于不修改代码跑不同调度策略实验）。
 SCHEDULER_CONFIG = "default"
