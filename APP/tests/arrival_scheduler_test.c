@@ -1,6 +1,10 @@
 /* Remote-only regression checks of real picoquic planning and STREAM framing.
  * No sockets, Mininet or media processes. Compile against the pinned core.
  */
+#ifndef _WINDOWS
+/* picoquic_utils.h uses POSIX thread types without including pthread.h. */
+#include <pthread.h>
+#endif
 #include "picoquic_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
