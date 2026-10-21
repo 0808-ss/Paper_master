@@ -25,12 +25,12 @@ EXPECTED="$(git -C "$ROOT" rev-parse HEAD:picoquic)"
 git -C "$SUB" bundle verify "$BUNDLE"
 
 echo "== fetching work from bundle: $BUNDLE"
-git -C "$SUB" fetch --tags "$BUNDLE" 'refs/heads/*:refs/remotes/bundle/*'
+git -C "$SUB" fetch --no-recurse-submodules --tags "$BUNDLE" 'refs/heads/*:refs/remotes/bundle/*'
 
 case "$MODE" in
-  ff-only) git -C "$SUB" merge --ff-only bundle/work ;;
-  merge)   git -C "$SUB" merge bundle/work ;;
-  rebase)  git -C "$SUB" rebase bundle/work ;;
+  ff-only) git -C "$SUB" -c submodule.recurse=false merge --ff-only bundle/work ;;
+  merge)   git -C "$SUB" -c submodule.recurse=false merge bundle/work ;;
+  rebase)  git -C "$SUB" -c submodule.recurse=false rebase bundle/work ;;
   *) echo "unknown mode: $MODE (use ff-only|merge|rebase)" >&2; exit 1 ;;
 esac
 

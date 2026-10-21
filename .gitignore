@@ -38,6 +38,7 @@ dist/
 
 # ===== sync bundles (keep local, never push) =====
 sync/*.bundle
+sync/bundles.sha256
 
 # GStreamer media builds and per-run raw/encoded artifacts
 APP/video_sender_gst
